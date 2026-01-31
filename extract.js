@@ -19,7 +19,7 @@ class PKGExtractor {
         // Check if input is URL or local file
         if (pkgPathOrUrl.startsWith('http://') || pkgPathOrUrl.startsWith('https://')) {
             console.log("🌐 Detected URL - downloading first 200 MB...");
-            buffer = await this.downloadPartialFile(pkgPathOrUrl, 200 * 1024 * 1024);
+            buffer = await this.downloadPartialFile(pkgPathOrUrl, 10 * 1024 * 1024);
             isUrl = true;
         } else {
             console.log("📁 Detected local file...");
@@ -59,7 +59,7 @@ class PKGExtractor {
 
     async downloadPartialFile(fileUrl, maxBytes) {
         return new Promise((resolve, reject) => {
-            const parsedUrl = url.parse(fileUrl);
+            const parsedUrl = new URL(urlString);
             const protocol = parsedUrl.protocol === 'https:' ? https : http;
 
             const req = protocol.get(fileUrl, (res) => {
