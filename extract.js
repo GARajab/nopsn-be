@@ -19,7 +19,7 @@ class PKGExtractor {
         // Check if input is URL or local file
         if (pkgPathOrUrl.startsWith('http://') || pkgPathOrUrl.startsWith('https://')) {
             console.log("🌐 Detected URL - downloading first 200 MB...");
-            buffer = await this.downloadPartialFile(pkgPathOrUrl, 10 * 1024 * 1024);
+            buffer = await this.downloadPartialFile(pkgPathOrUrl, 2 * 1024 * 1024);
             isUrl = true;
         } else {
             console.log("📁 Detected local file...");
