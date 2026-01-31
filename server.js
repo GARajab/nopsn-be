@@ -11,7 +11,7 @@ const PKGExtractor = require('./extract.js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configure CORS to allow all origins (for multiple users)
+// Configure CORS to allow all origins
 app.use(cors({
     origin: '*',
     credentials: true
@@ -36,27 +36,30 @@ class MultiUserInstaller {
             fs.mkdirSync(this.uploadDir, { recursive: true });
         }
 
-        this.addLog(`✅ MultiUserInstaller initialized on ${this.pcIp}:${this.callbackPort}`);
+        this.addLog(`✅ MultiUserInstaller initialized`);
+        this.addLog(`🌐 Server IP: ${this.pcIp}`);
+        this.addLog(`📞 Callback Port: ${this.callbackPort}`);
     }
 
     getDeploymentIp() {
-        // For Render.com, use the public URL
+        // For Render.com, extract IP from URL
         if (process.env.RENDER_EXTERNAL_URL) {
             const url = process.env.RENDER_EXTERNAL_URL;
-            this.addLog(`🌐 Using Render URL: ${url}`);
-            return url.replace('https://', '').replace('http://', '').split(':')[0];
+            const hostname = url.replace('https://', '').replace('http://', '').split(':')[0];
+            this.addLog(`🌐 Using Render hostname: ${hostname}`);
+            return hostname;
         }
 
+        // Try to get public IP
         if (process.env.PUBLIC_IP) {
-            this.addLog(`🌐 Using PUBLIC_IP: ${process.env.PUBLIC_IP}`);
             return process.env.PUBLIC_IP;
         }
 
         if (process.env.SERVER_DOMAIN) {
-            this.addLog(`🌐 Using SERVER_DOMAIN: ${process.env.SERVER_DOMAIN}`);
             return process.env.SERVER_DOMAIN;
         }
 
+        // For local testing
         return this.getLocalIp();
     }
 
@@ -64,7 +67,9 @@ class MultiUserInstaller {
         const interfaces = os.networkInterfaces();
         for (const name of Object.keys(interfaces)) {
             for (const iface of interfaces[name]) {
-                if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+                if (iface.family === 'IPv4' && !iface.internal) {
+                    return iface.address;
+                }
             }
         }
         return "127.0.0.1";
@@ -93,7 +98,11 @@ class MultiUserInstaller {
 
         if (offset === -1) throw new Error("Placeholder 0xB4... not found in payload.bin");
 
-        const ipBytes = Buffer.from(this.pcIp.split('.').map(Number));
+        // Convert IP to bytes - VERY IMPORTANT: Use IP for TCP connection, not HTTPS URL
+        const ipToUse = "74.220.49.1"; // Use Render's actual IP
+        this.addLog(`🔧 Using IP for payload: ${ipToUse}`);
+
+        const ipBytes = Buffer.from(ipToUse.split('.').map(Number));
         const portBytes = Buffer.alloc(2);
         portBytes.writeUInt16BE(this.callbackPort, 0);
 
@@ -205,7 +214,18 @@ class MultiUserInstaller {
     }
 
     buildMetadataPacket(pkgUrl, pkgSize, pkgInfo) {
-        const urlData = Buffer.from(pkgUrl, 'utf-8');
+        // IMPORTANT: Use HTTP URL for the PS4, not HTTPS
+        let pkgUrlForPS4 = pkgUrl;
+
+        // If PKG URL is HTTPS, we need to serve it via HTTP proxy
+        if (pkgUrl.toLowerCase().startsWith('https://')) {
+            // For HTTPS URLs, we'll need to proxy them through our HTTP server
+            // For now, we'll try to use HTTP if available
+            pkgUrlForPS4 = pkgUrl.replace('https://', 'http://');
+            this.addLog(`⚠️ Converting HTTPS URL to HTTP for PS4: ${pkgUrlForPS4}`);
+        }
+
+        const urlData = Buffer.from(pkgUrlForPS4, 'utf-8');
         const nameData = Buffer.from(pkgInfo.title || 'Game', 'utf-8');
         const contentIdData = Buffer.from(pkgInfo.contentId || 'UP0000-CUSA00000_00-GAME0000000000', 'utf-8');
         const titleIdData = Buffer.from(pkgInfo.titleId || 'CUSA00000', 'utf-8');
@@ -257,7 +277,7 @@ class MultiUserInstaller {
         return packet;
     }
 
-    startOrGetCallbackServer() {
+    startCallbackServer() {
         if (!this.callbackServer) {
             this.callbackServer = net.createServer((socket) => {
                 const connectionId = `conn_${Date.now()}_${++this.connectionCounter}`;
@@ -269,7 +289,8 @@ class MultiUserInstaller {
                     startTime: Date.now(),
                     installationId: null,
                     lastActivity: Date.now(),
-                    bytesStreamed: 0
+                    bytesStreamed: 0,
+                    isMetadataSent: false
                 };
                 this.activeConnections.set(connectionId, connection);
 
@@ -294,48 +315,11 @@ class MultiUserInstaller {
                     this.activeConnections.delete(connectionId);
                 });
 
-                // Handle incoming data
-                socket.once('data', (data) => {
-                    try {
-                        connection.lastActivity = Date.now();
-
-                        let installationId = null;
-
-                        // Method 1: Check if data contains installation ID
-                        if (data.length >= 5) {
-                            const potentialId = data.toString('utf-8', 0, Math.min(data.length, 32)).trim();
-                            if (potentialId.length > 5 && potentialId.startsWith('inst_')) {
-                                installationId = potentialId.split(/[^\w_]/)[0];
-                            }
-                        }
-
-                        // Method 2: Find an installation that hasn't sent metadata yet
-                        if (!installationId) {
-                            for (const [id, inst] of this.activeInstallations.entries()) {
-                                if (!inst.hasSentMetadata) {
-                                    installationId = id;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (installationId && this.activeInstallations.has(installationId)) {
-                            connection.installationId = installationId;
-                            this.addLog(`📡 Connection ${connectionId} → Installation: ${installationId}`);
-                            this.handlePS4Connection(socket, connectionId, installationId);
-                        } else {
-                            this.addLog(`⚠️ No installation found for ${connectionId}`);
-                            socket.write(Buffer.from([0x01]));
-                            socket.end();
-                        }
-                    } catch (err) {
-                        this.addLog(`❌ Connection handler error: ${err.message}`);
-                        socket.destroy();
-                    }
-                });
+                // Handle the connection
+                this.handleConnection(socket, connectionId);
 
             }).listen(this.callbackPort, () => {
-                this.addLog(`🎯 Callback server listening on port ${this.callbackPort}`);
+                this.addLog(`🎯 Callback server listening on TCP port ${this.callbackPort} (HTTP protocol)`);
             });
 
             this.callbackServer.on('error', (err) => {
@@ -357,6 +341,57 @@ class MultiUserInstaller {
         return this.callbackServer;
     }
 
+    handleConnection(socket, connectionId) {
+        const connection = this.activeConnections.get(connectionId);
+        if (!connection) return;
+
+        let buffer = Buffer.alloc(0);
+
+        socket.on('data', (data) => {
+            try {
+                connection.lastActivity = Date.now();
+                buffer = Buffer.concat([buffer, data]);
+
+                // Try to parse installation ID from data
+                const dataStr = buffer.toString('utf-8', 0, Math.min(buffer.length, 100));
+
+                // Look for installation ID pattern
+                let installationId = null;
+                const idMatch = dataStr.match(/inst_[a-z0-9_]+/i);
+                if (idMatch) {
+                    installationId = idMatch[0];
+                }
+
+                if (installationId) {
+                    this.addLog(`📡 Connection ${connectionId} → Installation: ${installationId}`);
+                    connection.installationId = installationId;
+                    this.handlePS4Connection(socket, connectionId, installationId);
+                } else if (!connection.isMetadataSent) {
+                    // First connection without ID - find installation waiting for metadata
+                    for (const [id, inst] of this.activeInstallations.entries()) {
+                        if (!inst.hasSentMetadata) {
+                            installationId = id;
+                            break;
+                        }
+                    }
+
+                    if (installationId) {
+                        this.addLog(`📡 Connection ${connectionId} → Installation (auto): ${installationId}`);
+                        connection.installationId = installationId;
+                        this.handlePS4Connection(socket, connectionId, installationId);
+                    } else {
+                        // No installation found
+                        this.addLog(`⚠️ No active installation found for ${connectionId}`);
+                        socket.end();
+                    }
+                }
+            } catch (err) {
+                this.addLog(`❌ Connection handler error: ${err.message}`);
+                socket.destroy();
+            }
+        });
+    }
+
     createInstallation(pkgUrl, pkgSize, pkgInfo) {
         const installationId = `inst_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
 
@@ -370,7 +405,6 @@ class MultiUserInstaller {
             createdAt: Date.now(),
             connections: new Set(),
             dataStreamStarted: false,
-            fileStream: null,
             httpStream: null
         };
 
@@ -378,7 +412,7 @@ class MultiUserInstaller {
         this.addLog(`📦 Created installation: ${installationId} for "${pkgInfo.title}"`);
 
         // Ensure callback server is running
-        this.startOrGetCallbackServer();
+        this.startCallbackServer();
 
         return installationId;
     }
@@ -407,6 +441,7 @@ class MultiUserInstaller {
             this.sendMetadata(socket, connectionId, installation);
             installation.hasSentMetadata = true;
             installation.currentSocket = socket;
+            connection.isMetadataSent = true;
         } else if (!installation.isStreaming) {
             // Second connection - start streaming package data
             this.addLog(`✅ PS4 ${installationId} ready to download "${installation.pkgInfo.title}"`);
@@ -609,11 +644,10 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
         server: 'PS4 Multi-User Installer',
-        backend: 'https://nopsn-be.onrender.com',
-        frontend: 'http://nopsn-fe.free.nf',
+        ip: installer.pcIp,
+        callbackPort: installer.callbackPort,
         activeInstallations: installer.activeInstallations.size,
         activeConnections: installer.activeConnections.size,
-        callbackPort: installer.callbackPort,
         uptime: process.uptime()
     });
 });
@@ -705,7 +739,7 @@ app.post('/api/prepare-install', async (req, res) => {
             extraction: extraction,
             serverIp: installer.pcIp,
             callbackPort: installer.callbackPort,
-            serverUrl: `https://${installer.pcIp}`,
+            serverUrl: `http://${installer.pcIp}:${PORT}`,
             note: "Send this payload to your PS4. Each installation has a unique ID."
         });
     } catch (error) {
@@ -713,6 +747,9 @@ app.post('/api/prepare-install', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// Serve static HTML frontend
+app.use(express.static('public'));
 
 app.get('/api/installation/:id', (req, res) => {
     const status = installer.getInstallationStatus(req.params.id);
@@ -779,35 +816,47 @@ app.get('/api/stats', (req, res) => {
             activeConnections: installer.activeConnections.size,
             totalLogs: installer.installationLog.length,
             callbackServer: installer.callbackServer ? 'Running' : 'Stopped'
-        },
-        limits: {
-            maxConcurrentInstallations: 50,
-            installationTimeout: "15 minutes",
-            connectionTimeout: "30 seconds"
         }
     });
 });
 
+// Default route
 app.get('/', (req, res) => {
-    res.json({
-        message: 'PS4 Multi-User Direct Installer API',
-        version: '2.0',
-        backend: 'https://nopsn-be.onrender.com',
-        frontend: 'http://nopsn-fe.free.nf',
-        endpoints: {
-            'GET /': 'This info',
-            'GET /api/health': 'Server health',
-            'GET /api/stats': 'Server statistics',
-            'GET /api/installations': 'List active installations',
-            'GET /api/installation/:id': 'Get installation status',
-            'DELETE /api/installation/:id': 'Cleanup installation',
-            'GET /api/logs': 'View logs',
-            'DELETE /api/logs': 'Clear logs',
-            'POST /api/extract': 'Extract PKG metadata',
-            'POST /api/prepare-install': 'Create installation and get payload'
-        },
-        note: 'Supports multiple concurrent users. Each installation gets a unique ID.'
-    });
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>PS4 Multi-User Direct Installer</title>
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #1a1a1a; color: white; }
+                .container { max-width: 800px; margin: 0 auto; background: #2a2a2a; padding: 30px; border-radius: 10px; }
+                h1 { color: #0070ff; }
+                .info { background: #333; padding: 20px; border-radius: 5px; margin: 20px 0; text-align: left; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🎮 PS4 Multi-User Direct Installer</h1>
+                <p>Server is running on <strong>http://${installer.pcIp}:${PORT}</strong></p>
+                <p>Callback server on <strong>TCP port ${installer.callbackPort}</strong></p>
+                
+                <div class="info">
+                    <h3>📡 Important Notes:</h3>
+                    <p>• The PS4 payload uses <strong>TCP/HTTP only</strong> (no HTTPS)</p>
+                    <p>• Backend IP embedded in payload: <strong>${installer.pcIp}:${installer.callbackPort}</strong></p>
+                    <p>• Use the frontend at: <strong>http://nopsn-fe.free.nf</strong></p>
+                </div>
+                
+                <div class="info">
+                    <h3>📊 Server Status:</h3>
+                    <p>• Active Installations: ${installer.activeInstallations.size}</p>
+                    <p>• Active Connections: ${installer.activeConnections.size}</p>
+                    <p>• Callback Server: ${installer.callbackServer ? '✅ Running' : '❌ Stopped'}</p>
+                </div>
+            </div>
+        </body>
+        </html>
+    `);
 });
 
 // Error handling
@@ -828,13 +877,15 @@ app.use((req, res) => {
 const server = app.listen(PORT, () => {
     console.log(`\n🚀 PS4 Multi-User Installer API Server`);
     console.log(`======================================`);
-    console.log(`🌐 Backend URL: https://nopsn-be.onrender.com`);
-    console.log(`🎮 Frontend URL: http://nopsn-fe.free.nf`);
+    console.log(`🌐 Web Interface: http://${installer.pcIp}:${PORT}`);
+    console.log(`📞 Callback Server: TCP port ${installer.callbackPort} (HTTP protocol)`);
     console.log(`👥 Supports: Multiple concurrent users`);
-    console.log(`📞 Callback Port: ${installer.callbackPort}`);
     console.log(`🔒 CORS: All origins allowed`);
-    console.log(`Press Ctrl+C to stop`);
-    installer.addLog(`Multi-user server started on https://${installer.pcIp}`);
+    console.log(`\n📝 IMPORTANT: PS4 payload uses HTTP only, not HTTPS!`);
+    console.log(`📝 Backend IP in payload: ${installer.pcIp}:${installer.callbackPort}`);
+    console.log(`\nPress Ctrl+C to stop\n`);
+
+    installer.addLog(`Server started on http://${installer.pcIp}:${PORT}`);
 });
 
 // Graceful shutdown
