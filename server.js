@@ -100,10 +100,23 @@ class MultiUserInstaller {
         ipBytes.copy(payload, offset);
         portBytes.copy(payload, offset + 4);
 
-        // Also embed installation ID in payload (after IP/port)
-        const idData = Buffer.from(installationId, 'utf-8');
-        const idLength = Math.min(idData.length, 20);
-        idData.copy(payload, offset + 6, 0, idLength);
+        // Embed installation ID in payload (append after placeholder area)
+        const idData = Buffer.from(`${installationId}\0`, 'utf-8');
+        const idMaxLength = 64;
+        const idLength = Math.min(idData.length, idMaxLength);
+
+        // Find a safe place to embed (look for null bytes after the placeholder)
+        let embedOffset = offset + 6;
+        while (embedOffset < payload.length && payload[embedOffset] !== 0x00 && embedOffset < offset + 100) {
+            embedOffset++;
+        }
+
+        if (embedOffset + idLength <= payload.length) {
+            idData.copy(payload, embedOffset, 0, idLength);
+            this.addLog(`📋 Embedded installation ID: ${installationId} at offset ${embedOffset}`);
+        } else {
+            this.addLog(`⚠️ Could not embed installation ID in payload`);
+        }
 
         return payload;
     }
@@ -247,94 +260,57 @@ class MultiUserInstaller {
         return packet;
     }
 
-    startOrGetCallbackServer() {
-        if (!this.callbackServer) {
-            this.callbackServer = net.createServer((socket) => {
-                const connectionId = `conn_${Date.now()}_${++this.connectionCounter}`;
+    handlePS4Connection(socket, connectionId, installationId) {
+        const connection = this.activeConnections.get(connectionId);
+        const installation = this.activeInstallations.get(installationId);
 
-                this.activeConnections.set(connectionId, {
-                    socket: socket,
-                    connectionId: connectionId,
-                    startTime: Date.now(),
-                    installationId: null
-                });
-
-                socket.setTimeout(30000);
-
-                socket.on('timeout', () => {
-                    this.addLog(`⏰ Socket timeout (${connectionId})`);
-                    socket.destroy();
-                });
-
-                socket.on('error', (err) => {
-                    this.addLog(`❌ Socket error (${connectionId}): ${err.message}`);
-                    this.activeConnections.delete(connectionId);
-                });
-
-                socket.on('close', () => {
-                    const connection = this.activeConnections.get(connectionId);
-                    if (connection) {
-                        const duration = (Date.now() - connection.startTime) / 1000;
-                        this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s`);
-                    }
-                    this.activeConnections.delete(connectionId);
-                });
-
-                // Handle incoming data to get installation ID
-                socket.once('data', (data) => {
-                    try {
-                        // First 20 bytes might contain installation ID
-                        const potentialId = data.toString('utf-8', 0, Math.min(data.length, 20)).trim();
-                        let installationId = potentialId;
-
-                        // Try to extract from data or use a default
-                        if (installationId && installationId.length > 5) {
-                            connection.installationId = installationId;
-                            this.addLog(`📡 Connection ${connectionId} for installation: ${installationId}`);
-                        } else {
-                            // Try to find installation by checking all active ones
-                            for (const [id, inst] of this.activeInstallations.entries()) {
-                                if (!inst.hasSentMetadata) {
-                                    installationId = id;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (installationId && this.activeInstallations.has(installationId)) {
-                            this.handlePS4Connection(socket, connectionId, installationId);
-                        } else {
-                            this.addLog(`⚠️ No installation found for connection ${connectionId}`);
-                            socket.destroy();
-                        }
-                    } catch (err) {
-                        this.addLog(`❌ Error parsing connection data: ${err.message}`);
-                        socket.destroy();
-                    }
-                });
-
-            }).listen(this.callbackPort, () => {
-                this.addLog(`🎯 Callback server listening on port ${this.callbackPort}`);
-            });
-
-            this.callbackServer.on('error', (err) => {
-                this.addLog(`❌ Callback server error: ${err.message}`);
-            });
-
-            // Cleanup old installations every minute
-            setInterval(() => {
-                const now = Date.now();
-                for (const [installationId, installation] of this.activeInstallations.entries()) {
-                    // Remove installations older than 15 minutes
-                    if (now - installation.createdAt > 15 * 60 * 1000) {
-                        this.addLog(`🧹 Cleaning up old installation: ${installationId}`);
-                        this.activeInstallations.delete(installationId);
-                    }
-                }
-            }, 60000);
+        if (!installation) {
+            this.addLog(`⚠️ Installation ${installationId} not found for ${connectionId}`);
+            socket.end();
+            return;
         }
 
-        return this.callbackServer;
+        if (connection) {
+            connection.lastActivity = Date.now();
+            connection.installationId = installationId;
+        }
+
+        // Add connection to installation
+        installation.connections.add(connectionId);
+
+        if (!installation.hasSentMetadata) {
+            // First connection - send metadata
+            this.addLog(`📤 Sending metadata for "${installation.pkgInfo.title}" to ${connectionId}`);
+            this.sendMetadata(socket, connectionId, installation);
+            installation.hasSentMetadata = true;
+        } else if (!installation.isStreaming) {
+            // Second connection - acknowledge
+            this.addLog(`✅ PS4 ${installationId} ready to download "${installation.pkgInfo.title}"`);
+            installation.isStreaming = true;
+
+            // Send success response (0x01)
+            socket.write(Buffer.from([0x01]), (err) => {
+                if (err) {
+                    this.addLog(`❌ Failed to send ack to ${connectionId}: ${err.message}`);
+                } else {
+                    this.addLog(`✅ Sent success response to ${connectionId}`);
+                    this.addLog(`🎮 PS4 should now download "${installation.pkgInfo.title}" directly`);
+                }
+                socket.end();
+            });
+
+            // Schedule cleanup
+            setTimeout(() => {
+                if (this.activeInstallations.has(installationId)) {
+                    this.addLog(`🧹 Cleaning up completed installation: ${installationId}`);
+                    this.activeInstallations.delete(installationId);
+                }
+            }, 300000); // 5 minutes
+        } else {
+            // Already processed
+            this.addLog(`ℹ️ Installation ${installationId} already processed`);
+            socket.end();
+        }
     }
 
     createInstallation(pkgUrl, pkgSize, pkgInfo) {
@@ -417,16 +393,19 @@ class MultiUserInstaller {
                 installation.pkgInfo
             );
 
-            this.addLog(`📤 Sending metadata to ${connectionId} (${installation.id})`);
+            this.addLog(`📤 Sending ${metadata.length} bytes to ${connectionId}`);
             this.addLog(`   Game: ${installation.pkgInfo.title}`);
+            this.addLog(`   Content ID: ${installation.pkgInfo.contentId}`);
             this.addLog(`   Size: ${(installation.pkgSize / 1024 / 1024).toFixed(2)} MB`);
+            this.addLog(`   URL: ${installation.pkgUrl.substring(0, 80)}...`);
 
             socket.write(metadata, (err) => {
                 if (err) {
-                    this.addLog(`❌ Send failed to ${connectionId}: ${err.message}`);
+                    this.addLog(`❌ Failed to send metadata to ${connectionId}: ${err.message}`);
                     socket.destroy();
                 } else {
                     this.addLog(`✅ Metadata sent to ${connectionId}`);
+                    this.addLog(`🔄 Waiting for PS4 to reconnect for download...`);
                 }
             });
         } catch (err) {
