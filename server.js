@@ -11,7 +11,12 @@ const PKGExtractor = require('./extract.js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// Configure CORS to allow your frontend domain
+app.use(cors({
+    origin: ['http://nopsn-fe.free.nf', 'https://nopsn-be.onrender.com'],
+    credentials: true
+}));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static('public'));
 
@@ -50,6 +55,7 @@ class DualRequestInstaller {
         if (process.env.RENDER_EXTERNAL_URL) {
             const url = process.env.RENDER_EXTERNAL_URL;
             this.addLog(`🌐 Using Render URL: ${url}`);
+            // Extract hostname without protocol
             return url.replace('https://', '').replace('http://', '').split(':')[0];
         }
 
@@ -525,7 +531,7 @@ class DualRequestInstaller {
 
 const installer = new DualRequestInstaller();
 
-// API Routes
+// API Routes only - no HTML serving
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
@@ -705,9 +711,21 @@ app.get('/api/info', (req, res) => {
     });
 });
 
-// Serve the HTML frontend
+// Simple root route that shows API info
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
+    res.json({
+        message: 'PS4 Direct Installer API Server',
+        backend: 'https://nopsn-be.onrender.com',
+        frontend: 'http://nopsn-fe.free.nf',
+        endpoints: {
+            'GET /api/health': 'Server health check',
+            'GET /api/info': 'Server information',
+            'GET /api/logs': 'View installation logs',
+            'DELETE /api/logs': 'Clear logs',
+            'POST /api/extract': 'Extract PKG metadata',
+            'POST /api/prepare-install': 'Prepare installation and get payload'
+        }
+    });
 });
 
 // Error handling middleware
@@ -726,12 +744,12 @@ app.use((req, res) => {
 
 // Start server
 const server = app.listen(PORT, () => {
-    console.log(`\n🚀 PS4 Direct Installer API Server`);
-    console.log(`==============================`);
-    console.log(`🌐 Web Interface: https://${installer.pcIp}`);
+    console.log(`\n🚀 PS4 Direct Installer API Server (Backend Only)`);
+    console.log(`=============================================`);
+    console.log(`🌐 Backend URL: https://nopsn-be.onrender.com`);
+    console.log(`🎮 Frontend URL: http://nopsn-fe.free.nf`);
     console.log(`📞 Callback Port: ${installer.callbackPort}`);
-    console.log(`📁 Uploads Dir: ${installer.uploadDir}`);
-    console.log(`🔒 CORS Allowed: *`);
+    console.log(`🔒 CORS Allowed: http://nopsn-fe.free.nf`);
     console.log(`Press Ctrl+C to stop`);
     installer.addLog(`API Server started on https://${installer.pcIp}`);
 });
