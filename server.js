@@ -529,10 +529,14 @@ class DualRequestInstaller {
             this.addLog(`✅ PS4 reconnected for data`);
             installation.currentSocket = socket;
             installation.isStreaming = true;
-            this.streamPackageData(socket, connectionId, installation);
-        } else {
-            this.addLog(`⚠️ Already streaming to another connection`);
-            socket.destroy();
+
+            // COMMENT OUT or CHANGE this line:
+            // this.streamPackageData(socket, connectionId, installation);
+
+            // INSTEAD, just acknowledge and let PS4 download:
+            this.addLog(`✅ PS4 acknowledged - it should now download directly`);
+            socket.write(Buffer.from([0x01])); // Send success byte
+            socket.end();
         }
     }
 
@@ -563,212 +567,206 @@ class DualRequestInstaller {
     }
 
     streamPackageData(socket, connectionId, installation) {
-        this.addLog(`🔌 Closing PS4 connection, starting download`);
+        this.addLog(`✅ PS4 ready to download directly from source`);
 
-        // Don't destroy socket immediately, let it close naturally
+        // Don't download on server - just close connection
+        // The PS4 will download directly from the URL we sent in metadata
         installation.currentSocket = null;
         installation.isStreaming = false;
 
-        this.downloadPackageToLocalCache(installation)
-            .then(localPath => {
-                this.addLog(`✅ Cached to: ${path.basename(localPath)}`);
-                this.waitForPS4Reconnection(installation, localPath);
-            })
-            .catch(error => {
-                this.addLog(`❌ Download failed: ${error.message}`);
-                installation.isStreaming = false;
+        // PS4 will now download directly from the URL
+        this.addLog(`📤 PS4 should now download directly from: ${installation.pkgUrl}`);
 
-                // Increment reconnect attempts
-                installation.reconnectAttempts++;
-                if (installation.reconnectAttempts >= installation.maxReconnectAttempts) {
-                    this.addLog(`❌ Max reconnect attempts reached, stopping installation`);
-                    this.stopCallbackServer();
-                }
-            });
-    }
-
-    async downloadPackageToLocalCache(installation) {
-        return new Promise((resolve, reject) => {
-            const parsedUrl = new URL(installation.pkgUrl);
-            const protocol = parsedUrl.protocol === 'https:' ? https : http;
-
-            const cacheFilename = `cache_${installation.id}.pkg`;
-            const cachePath = path.join(this.uploadDir, cacheFilename);
-
-            this.addLog(`📥 Downloading to cache: ${cacheFilename}`);
-
-            const options = {
-                hostname: parsedUrl.hostname,
-                port: parsedUrl.port,
-                path: parsedUrl.pathname + parsedUrl.search,
-                timeout: 120000, // 2 minute timeout
-                headers: {
-                    'User-Agent': 'PS4-Installer/1.0',
-                    'Accept-Encoding': 'identity' // No compression for accurate progress
-                }
-            };
-
-            const req = protocol.get(options, (res) => {
-                if (res.statusCode !== 200) {
-                    reject(new Error(`HTTP ${res.statusCode}`));
-                    return;
-                }
-
-                const fileStream = fs.createWriteStream(cachePath);
-                const contentLength = parseInt(res.headers['content-length'] || '0', 10);
-                let downloaded = 0;
-                let lastLog = Date.now();
-
-                res.pipe(fileStream);
-
-                res.on('data', (chunk) => {
-                    downloaded += chunk.length;
-                    const now = Date.now();
-                    if (now - lastLog > 5000) {
-                        const percent = contentLength > 0 ?
-                            ((downloaded / contentLength) * 100).toFixed(1) : '??';
-                        this.addLog(`📊 ${(downloaded / 1024 / 1024).toFixed(2)}MB (${percent}%)`);
-                        lastLog = now;
-                    }
-                });
-
-                fileStream.on('finish', () => {
-                    fileStream.close();
-                    this.addLog(`✅ Download complete: ${(downloaded / 1024 / 1024).toFixed(2)}MB`);
-                    resolve(cachePath);
-                });
-
-                fileStream.on('error', (err) => {
-                    fileStream.destroy();
-                    try { fs.unlinkSync(cachePath); } catch (e) { }
-                    reject(new Error(`File write error: ${err.message}`));
-                });
-
-                res.on('error', (err) => {
-                    fileStream.destroy();
-                    try { fs.unlinkSync(cachePath); } catch (e) { }
-                    reject(new Error(`Download error: ${err.message}`));
-                });
-            });
-
-            req.on('error', (err) => {
-                reject(new Error(`Request error: ${err.message}`));
-            });
-
-            req.setTimeout(120000, () => {
-                req.destroy();
-                reject(new Error('Download timeout'));
-            });
-        });
-    }
-
-    waitForPS4Reconnection(installation, localPath) {
-        const reconnectTimeout = setTimeout(() => {
-            this.addLog(`❌ PS4 didn't reconnect within timeout`);
-            installation.isStreaming = false;
-            try {
-                if (fs.existsSync(localPath)) {
-                    fs.unlinkSync(localPath);
-                    this.addLog(`🧹 Removed cache file: ${path.basename(localPath)}`);
-                }
-            } catch (e) {
-                // Ignore cleanup errors
-            }
-        }, 45000); // 45 second timeout
-
-        const checkInterval = setInterval(() => {
-            if (installation.currentSocket &&
-                !installation.currentSocket.destroyed &&
-                installation.currentSocket.writable) {
-
-                clearTimeout(reconnectTimeout);
-                clearInterval(checkInterval);
-                this.streamFromCache(installation.currentSocket, localPath, installation);
-                return;
-            }
-
+        // Clean up after timeout
+        setTimeout(() => {
             if (!installation.isStreaming) {
-                clearTimeout(reconnectTimeout);
-                clearInterval(checkInterval);
-                try {
-                    if (fs.existsSync(localPath)) {
-                        fs.unlinkSync(localPath);
-                    }
-                } catch (e) {
-                    // Ignore cleanup errors
-                }
+                this.addLog(`🔄 Installation completed or timed out`);
             }
-        }, 1000);
+        }, 60000); // 1 minute timeout
     }
 
-    streamFromCache(socket, cachePath, installation) {
-        try {
-            if (!fs.existsSync(cachePath)) {
-                throw new Error(`Cache file not found: ${cachePath}`);
-            }
+    // async downloadPackageToLocalCache(installation) {
+    //     return new Promise((resolve, reject) => {
+    //         const parsedUrl = new URL(installation.pkgUrl);
+    //         const protocol = parsedUrl.protocol === 'https:' ? https : http;
 
-            const fileSize = fs.statSync(cachePath).size;
-            const fileStream = fs.createReadStream(cachePath);
+    //         const cacheFilename = `cache_${installation.id}.pkg`;
+    //         const cachePath = path.join(this.uploadDir, cacheFilename);
 
-            this.addLog(`📤 Streaming from cache: ${(fileSize / 1024 / 1024).toFixed(2)}MB`);
+    //         this.addLog(`📥 Downloading to cache: ${cacheFilename}`);
 
-            let streamed = 0;
-            let lastLog = Date.now();
+    //         const options = {
+    //             hostname: parsedUrl.hostname,
+    //             port: parsedUrl.port,
+    //             path: parsedUrl.pathname + parsedUrl.search,
+    //             timeout: 120000, // 2 minute timeout
+    //             headers: {
+    //                 'User-Agent': 'PS4-Installer/1.0',
+    //                 'Accept-Encoding': 'identity' // No compression for accurate progress
+    //             }
+    //         };
 
-            fileStream.on('data', (chunk) => {
-                streamed += chunk.length;
+    //         const req = protocol.get(options, (res) => {
+    //             if (res.statusCode !== 200) {
+    //                 reject(new Error(`HTTP ${res.statusCode}`));
+    //                 return;
+    //             }
 
-                const canWrite = socket.write(chunk);
-                if (!canWrite) {
-                    fileStream.pause();
-                    socket.once('drain', () => fileStream.resume());
-                }
+    //             const fileStream = fs.createWriteStream(cachePath);
+    //             const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+    //             let downloaded = 0;
+    //             let lastLog = Date.now();
 
-                const now = Date.now();
-                if (now - lastLog > 5000) {
-                    const percent = ((streamed / fileSize) * 100).toFixed(1);
-                    this.addLog(`📦 ${(streamed / 1024 / 1024).toFixed(2)}MB (${percent}%)`);
-                    lastLog = now;
-                }
-            });
+    //             res.pipe(fileStream);
 
-            fileStream.on('end', () => {
-                this.addLog(`✅ Stream complete!`);
-                setTimeout(() => {
-                    if (!socket.destroyed) {
-                        socket.end();
-                    }
-                }, 1000);
+    //             res.on('data', (chunk) => {
+    //                 downloaded += chunk.length;
+    //                 const now = Date.now();
+    //                 if (now - lastLog > 5000) {
+    //                     const percent = contentLength > 0 ?
+    //                         ((downloaded / contentLength) * 100).toFixed(1) : '??';
+    //                     this.addLog(`📊 ${(downloaded / 1024 / 1024).toFixed(2)}MB (${percent}%)`);
+    //                     lastLog = now;
+    //                 }
+    //             });
 
-                // Cleanup cache file
-                this.safeDeleteFile(cachePath);
-            });
+    //             fileStream.on('finish', () => {
+    //                 fileStream.close();
+    //                 this.addLog(`✅ Download complete: ${(downloaded / 1024 / 1024).toFixed(2)}MB`);
+    //                 resolve(cachePath);
+    //             });
 
-            fileStream.on('error', (err) => {
-                this.addLog(`❌ Stream error: ${err.message}`);
-                socket.destroy();
-                this.safeDeleteFile(cachePath);
-            });
+    //             fileStream.on('error', (err) => {
+    //                 fileStream.destroy();
+    //                 try { fs.unlinkSync(cachePath); } catch (e) { }
+    //                 reject(new Error(`File write error: ${err.message}`));
+    //             });
 
-            socket.on('error', (err) => {
-                this.addLog(`❌ Socket error during streaming: ${err.message}`);
-                fileStream.destroy();
-                this.safeDeleteFile(cachePath);
-            });
+    //             res.on('error', (err) => {
+    //                 fileStream.destroy();
+    //                 try { fs.unlinkSync(cachePath); } catch (e) { }
+    //                 reject(new Error(`Download error: ${err.message}`));
+    //             });
+    //         });
 
-            socket.on('close', () => {
-                fileStream.destroy();
-                this.safeDeleteFile(cachePath);
-                installation.isStreaming = false;
-            });
+    //         req.on('error', (err) => {
+    //             reject(new Error(`Request error: ${err.message}`));
+    //         });
 
-        } catch (err) {
-            this.addLog(`❌ Streaming setup error: ${err.message}`);
-            socket.destroy();
-            this.safeDeleteFile(cachePath);
-            installation.isStreaming = false;
-        }
-    }
+    //         req.setTimeout(120000, () => {
+    //             req.destroy();
+    //             reject(new Error('Download timeout'));
+    //         });
+    //     });
+    // }
+
+    // waitForPS4Reconnection(installation, localPath) {
+    //     const reconnectTimeout = setTimeout(() => {
+    //         this.addLog(`❌ PS4 didn't reconnect within timeout`);
+    //         installation.isStreaming = false;
+    //         try {
+    //             if (fs.existsSync(localPath)) {
+    //                 fs.unlinkSync(localPath);
+    //                 this.addLog(`🧹 Removed cache file: ${path.basename(localPath)}`);
+    //             }
+    //         } catch (e) {
+    //             // Ignore cleanup errors
+    //         }
+    //     }, 45000); // 45 second timeout
+
+    //     const checkInterval = setInterval(() => {
+    //         if (installation.currentSocket &&
+    //             !installation.currentSocket.destroyed &&
+    //             installation.currentSocket.writable) {
+
+    //             clearTimeout(reconnectTimeout);
+    //             clearInterval(checkInterval);
+    //             this.streamFromCache(installation.currentSocket, localPath, installation);
+    //             return;
+    //         }
+
+    //         if (!installation.isStreaming) {
+    //             clearTimeout(reconnectTimeout);
+    //             clearInterval(checkInterval);
+    //             try {
+    //                 if (fs.existsSync(localPath)) {
+    //                     fs.unlinkSync(localPath);
+    //                 }
+    //             } catch (e) {
+    //                 // Ignore cleanup errors
+    //             }
+    //         }
+    //     }, 1000);
+    // }
+
+    // streamFromCache(socket, cachePath, installation) {
+    //     try {
+    //         if (!fs.existsSync(cachePath)) {
+    //             throw new Error(`Cache file not found: ${cachePath}`);
+    //         }
+
+    //         const fileSize = fs.statSync(cachePath).size;
+    //         const fileStream = fs.createReadStream(cachePath);
+
+    //         this.addLog(`📤 Streaming from cache: ${(fileSize / 1024 / 1024).toFixed(2)}MB`);
+
+    //         let streamed = 0;
+    //         let lastLog = Date.now();
+
+    //         fileStream.on('data', (chunk) => {
+    //             streamed += chunk.length;
+
+    //             const canWrite = socket.write(chunk);
+    //             if (!canWrite) {
+    //                 fileStream.pause();
+    //                 socket.once('drain', () => fileStream.resume());
+    //             }
+
+    //             const now = Date.now();
+    //             if (now - lastLog > 5000) {
+    //                 const percent = ((streamed / fileSize) * 100).toFixed(1);
+    //                 this.addLog(`📦 ${(streamed / 1024 / 1024).toFixed(2)}MB (${percent}%)`);
+    //                 lastLog = now;
+    //             }
+    //         });
+
+    //         fileStream.on('end', () => {
+    //             this.addLog(`✅ Stream complete!`);
+    //             setTimeout(() => {
+    //                 if (!socket.destroyed) {
+    //                     socket.end();
+    //                 }
+    //             }, 1000);
+
+    //             // Cleanup cache file
+    //             this.safeDeleteFile(cachePath);
+    //         });
+
+    //         fileStream.on('error', (err) => {
+    //             this.addLog(`❌ Stream error: ${err.message}`);
+    //             socket.destroy();
+    //             this.safeDeleteFile(cachePath);
+    //         });
+
+    //         socket.on('error', (err) => {
+    //             this.addLog(`❌ Socket error during streaming: ${err.message}`);
+    //             fileStream.destroy();
+    //             this.safeDeleteFile(cachePath);
+    //         });
+
+    //         socket.on('close', () => {
+    //             fileStream.destroy();
+    //             this.safeDeleteFile(cachePath);
+    //             installation.isStreaming = false;
+    //         });
+
+    //     } catch (err) {
+    //         this.addLog(`❌ Streaming setup error: ${err.message}`);
+    //         socket.destroy();
+    //         this.safeDeleteFile(cachePath);
+    //         installation.isStreaming = false;
+    //     }
+    // }
 
     safeDeleteFile(filePath) {
         try {
