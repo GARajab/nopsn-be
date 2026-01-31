@@ -59,7 +59,7 @@ class PKGExtractor {
 
     async downloadPartialFile(fileUrl, maxBytes) {
         return new Promise((resolve, reject) => {
-            const parsedUrl = new URL(urlString);
+            const parsedUrl = new URL(fileUrl);
             const protocol = parsedUrl.protocol === 'https:' ? https : http;
 
             const req = protocol.get(fileUrl, (res) => {
