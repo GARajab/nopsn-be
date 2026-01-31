@@ -11,43 +11,32 @@ const PKGExtractor = require('./extract.js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configure CORS to allow your frontend domain
+// Configure CORS to allow all origins (for multiple users)
 app.use(cors({
-    origin: ['http://nopsn-fe.free.nf', 'https://nopsn-be.onrender.com'],
+    origin: '*',
     credentials: true
 }));
 
 app.use(express.json({ limit: '10mb' }));
-app.use(express.static('public'));
 
-class DualRequestInstaller {
+class MultiUserInstaller {
     constructor() {
-        // Initialize ALL properties FIRST
         this.installationLog = [];
-        this.activeConnections = new Map();
-        this.currentInstallation = null;
+        this.activeInstallations = new Map(); // installationId -> installation
+        this.activeConnections = new Map(); // connectionId -> connection
         this.callbackServer = null;
         this.uploadDir = path.join(__dirname, 'uploads');
-        this.cacheCleanupInterval = null;
-        this.idleServerTimeout = null;
-        this.connectionCleanupInterval = null;
+        this.pcIp = this.getDeploymentIp();
+        this.callbackPort = 9022;
+        this.extractor = new PKGExtractor();
+        this.connectionCounter = 0;
 
         // Create uploads directory if it doesn't exist
         if (!fs.existsSync(this.uploadDir)) {
             fs.mkdirSync(this.uploadDir, { recursive: true });
         }
 
-        // Initialize extractor
-        this.extractor = new PKGExtractor();
-
-        // Get deployment IP for Render
-        this.pcIp = this.getDeploymentIp();
-        this.callbackPort = 9022; // Fixed port for Render
-
-        // Start cache cleanup
-        this.startCacheCleanup();
-
-        this.addLog(`✅ DualRequestInstaller initialized on ${this.pcIp}:${this.callbackPort}`);
+        this.addLog(`✅ MultiUserInstaller initialized on ${this.pcIp}:${this.callbackPort}`);
     }
 
     getDeploymentIp() {
@@ -55,11 +44,9 @@ class DualRequestInstaller {
         if (process.env.RENDER_EXTERNAL_URL) {
             const url = process.env.RENDER_EXTERNAL_URL;
             this.addLog(`🌐 Using Render URL: ${url}`);
-            // Extract hostname without protocol
             return url.replace('https://', '').replace('http://', '').split(':')[0];
         }
 
-        // Check for explicit PUBLIC_IP or SERVER_DOMAIN env vars
         if (process.env.PUBLIC_IP) {
             this.addLog(`🌐 Using PUBLIC_IP: ${process.env.PUBLIC_IP}`);
             return process.env.PUBLIC_IP;
@@ -70,7 +57,6 @@ class DualRequestInstaller {
             return process.env.SERVER_DOMAIN;
         }
 
-        // For local development
         return this.getLocalIp();
     }
 
@@ -88,21 +74,14 @@ class DualRequestInstaller {
         const timestamp = new Date().toLocaleTimeString();
         const logMsg = `[${timestamp}] ${msg}`;
         console.log(logMsg);
-
-        // Ensure installationLog exists (safety check)
-        if (!this.installationLog) {
-            this.installationLog = [];
-        }
-
         this.installationLog.push(logMsg);
 
-        // Keep log size manageable (last 1000 entries)
         if (this.installationLog.length > 1000) {
             this.installationLog = this.installationLog.slice(-1000);
         }
     }
 
-    preparePayload() {
+    preparePayload(installationId) {
         const payloadPath = path.join(__dirname, 'payload.bin');
         if (!fs.existsSync(payloadPath)) {
             throw new Error("payload.bin missing from server folder");
@@ -121,20 +100,22 @@ class DualRequestInstaller {
         ipBytes.copy(payload, offset);
         portBytes.copy(payload, offset + 4);
 
+        // Also embed installation ID in payload (after IP/port)
+        const idData = Buffer.from(installationId, 'utf-8');
+        const idLength = Math.min(idData.length, 20);
+        idData.copy(payload, offset + 6, 0, idLength);
+
         return payload;
     }
 
     async extractPkgInfo(pkgUrl) {
         try {
             this.addLog(`🔍 Extracting metadata from: ${pkgUrl}`);
-
             const result = await this.extractor.extractBGFTMetadata(pkgUrl);
 
-            // Prepare icon data for BGFT
             let iconBase64 = null;
             if (result.icon && result.icon.data) {
                 iconBase64 = result.icon.data.toString('base64');
-                this.addLog(`🖼️ Icon extracted: ${(result.icon.size / 1024).toFixed(2)} KB ${result.icon.type.toUpperCase()}`);
             }
 
             return {
@@ -147,14 +128,11 @@ class DualRequestInstaller {
                     titleId: result.bgft.titleId,
                     icon: iconBase64
                 },
-                fullInfo: result.basic,
-                hasIcon: result.bgft.hasIcon
+                fullInfo: result.basic
             };
 
         } catch (error) {
             this.addLog(`❌ Extraction failed: ${error.message}`);
-
-            // Fallback: Use filename as title
             const filename = path.basename(pkgUrl);
             const baseName = filename.replace('.pkg', '').replace(/_/g, ' ');
 
@@ -184,9 +162,7 @@ class DualRequestInstaller {
                 port: parsedUrl.port,
                 path: parsedUrl.pathname + parsedUrl.search,
                 timeout: 10000,
-                headers: {
-                    'User-Agent': 'PS4-Installer/1.0'
-                }
+                headers: { 'User-Agent': 'PS4-Installer/1.0' }
             };
 
             const req = protocol.request(options, (res) => {
@@ -200,7 +176,6 @@ class DualRequestInstaller {
                 } else if (res.statusCode === 302 || res.statusCode === 301) {
                     const redirectUrl = res.headers.location;
                     if (redirectUrl) {
-                        this.addLog(`⚠️ Following redirect to: ${redirectUrl}`);
                         this.getFileSize(redirectUrl).then(resolve).catch(reject);
                     } else {
                         reject(new Error(`HTTP ${res.statusCode}: No redirect location`));
@@ -210,28 +185,22 @@ class DualRequestInstaller {
                 }
             });
 
-            req.on('error', (err) => {
-                reject(new Error(`Network error: ${err.message}`));
-            });
-
+            req.on('error', reject);
             req.on('timeout', () => {
                 req.destroy();
                 reject(new Error('Timeout connecting to server'));
             });
-
             req.end();
         });
     }
 
     buildMetadataPacket(pkgUrl, pkgSize, pkgInfo) {
-        // BGFT format for PS4
         const urlData = Buffer.from(pkgUrl, 'utf-8');
         const nameData = Buffer.from(pkgInfo.title || 'Game', 'utf-8');
         const contentIdData = Buffer.from(pkgInfo.contentId || 'UP0000-CUSA00000_00-GAME0000000000', 'utf-8');
         const titleIdData = Buffer.from(pkgInfo.titleId || 'CUSA00000', 'utf-8');
 
-        // Calculate total size
-        let totalSize = 16; // Magic (4) + Version (4) + FileSize (8)
+        let totalSize = 16; // Magic + Version + FileSize
         totalSize += 4 + urlData.length;
         totalSize += 4 + nameData.length;
         totalSize += 4 + contentIdData.length;
@@ -272,222 +241,171 @@ class DualRequestInstaller {
         titleIdData.copy(packet, offset);
         offset += titleIdData.length;
 
-        // File size (64-bit little endian)
+        // File size
         packet.writeBigUInt64LE(BigInt(pkgSize), offset);
-
-        this.addLog(`📦 Built BGFT packet: ${packet.length} bytes`);
-        this.addLog(`   Title: "${pkgInfo.title || 'Game'}"`);
-        this.addLog(`   Content ID: ${pkgInfo.contentId}`);
-        this.addLog(`   Size: ${(pkgSize / 1024 / 1024).toFixed(2)} MB`);
 
         return packet;
     }
 
-    startCallbackServer(pkgUrl, pkgSize, pkgInfo) {
-        // Close existing server if running
-        if (this.callbackServer) {
-            this.addLog(`🔄 Stopping existing callback server...`);
-            this.stopCallbackServer();
+    startOrGetCallbackServer() {
+        if (!this.callbackServer) {
+            this.callbackServer = net.createServer((socket) => {
+                const connectionId = `conn_${Date.now()}_${++this.connectionCounter}`;
+
+                this.activeConnections.set(connectionId, {
+                    socket: socket,
+                    connectionId: connectionId,
+                    startTime: Date.now(),
+                    installationId: null
+                });
+
+                socket.setTimeout(30000);
+
+                socket.on('timeout', () => {
+                    this.addLog(`⏰ Socket timeout (${connectionId})`);
+                    socket.destroy();
+                });
+
+                socket.on('error', (err) => {
+                    this.addLog(`❌ Socket error (${connectionId}): ${err.message}`);
+                    this.activeConnections.delete(connectionId);
+                });
+
+                socket.on('close', () => {
+                    const connection = this.activeConnections.get(connectionId);
+                    if (connection) {
+                        const duration = (Date.now() - connection.startTime) / 1000;
+                        this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s`);
+                    }
+                    this.activeConnections.delete(connectionId);
+                });
+
+                // Handle incoming data to get installation ID
+                socket.once('data', (data) => {
+                    try {
+                        // First 20 bytes might contain installation ID
+                        const potentialId = data.toString('utf-8', 0, Math.min(data.length, 20)).trim();
+                        let installationId = potentialId;
+
+                        // Try to extract from data or use a default
+                        if (installationId && installationId.length > 5) {
+                            connection.installationId = installationId;
+                            this.addLog(`📡 Connection ${connectionId} for installation: ${installationId}`);
+                        } else {
+                            // Try to find installation by checking all active ones
+                            for (const [id, inst] of this.activeInstallations.entries()) {
+                                if (!inst.hasSentMetadata) {
+                                    installationId = id;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (installationId && this.activeInstallations.has(installationId)) {
+                            this.handlePS4Connection(socket, connectionId, installationId);
+                        } else {
+                            this.addLog(`⚠️ No installation found for connection ${connectionId}`);
+                            socket.destroy();
+                        }
+                    } catch (err) {
+                        this.addLog(`❌ Error parsing connection data: ${err.message}`);
+                        socket.destroy();
+                    }
+                });
+
+            }).listen(this.callbackPort, () => {
+                this.addLog(`🎯 Callback server listening on port ${this.callbackPort}`);
+            });
+
+            this.callbackServer.on('error', (err) => {
+                this.addLog(`❌ Callback server error: ${err.message}`);
+            });
+
+            // Cleanup old installations every minute
+            setInterval(() => {
+                const now = Date.now();
+                for (const [installationId, installation] of this.activeInstallations.entries()) {
+                    // Remove installations older than 15 minutes
+                    if (now - installation.createdAt > 15 * 60 * 1000) {
+                        this.addLog(`🧹 Cleaning up old installation: ${installationId}`);
+                        this.activeInstallations.delete(installationId);
+                    }
+                }
+            }, 60000);
         }
 
-        // Create installation session
-        const installationId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
-        this.currentInstallation = {
+        return this.callbackServer;
+    }
+
+    createInstallation(pkgUrl, pkgSize, pkgInfo) {
+        const installationId = `inst_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
+
+        const installation = {
             id: installationId,
             pkgUrl: pkgUrl,
             pkgSize: pkgSize,
             pkgInfo: pkgInfo,
             hasSentMetadata: false,
             isStreaming: false,
-            currentSocket: null,
-            reconnectAttempts: 0,
-            maxReconnectAttempts: 3
+            createdAt: Date.now(),
+            connections: new Set()
         };
 
-        this.addLog(`📦 Starting installation: ${installationId}`);
+        this.activeInstallations.set(installationId, installation);
+        this.addLog(`📦 Created installation: ${installationId} for "${pkgInfo.title}"`);
 
-        this.callbackServer = net.createServer((socket) => {
-            const connectionId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+        // Ensure callback server is running
+        this.startOrGetCallbackServer();
 
-            this.activeConnections.set(connectionId, {
-                socket: socket,
-                installationId: installationId,
-                connectionId: connectionId,
-                startTime: Date.now(),
-                bytesStreamed: 0,
-                lastActivity: Date.now()
-            });
-
-            // Set socket timeout
-            socket.setTimeout(120000);
-
-            socket.on('timeout', () => {
-                this.addLog(`⏰ Socket timeout (${connectionId})`);
-                socket.destroy();
-            });
-
-            socket.on('error', (err) => {
-                this.addLog(`❌ Socket error (${connectionId}): ${err.message}`);
-                this.activeConnections.delete(connectionId);
-            });
-
-            socket.on('close', () => {
-                const connection = this.activeConnections.get(connectionId);
-                if (connection) {
-                    const duration = (Date.now() - connection.startTime) / 1000;
-                    this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s`);
-                }
-                this.activeConnections.delete(connectionId);
-            });
-
-            this.handlePS4Connection(socket, connectionId, installationId);
-
-        }).listen(this.callbackPort, () => {
-            this.addLog(`🎯 Callback server listening on port ${this.callbackPort}`);
-        });
-
-        this.callbackServer.on('error', (err) => {
-            this.addLog(`❌ Callback server error: ${err.message}`);
-        });
-
-        // Start connection cleanup
-        this.startConnectionCleanup();
-
-        // Auto-close idle server after 10 minutes
-        this.idleServerTimeout = setTimeout(() => {
-            if (this.callbackServer && this.activeConnections.size === 0) {
-                this.addLog(`🔄 Auto-closing idle server`);
-                this.stopCallbackServer();
-            }
-        }, 10 * 60 * 1000);
-    }
-
-    stopCallbackServer() {
-        if (!this.callbackServer) {
-            return;
-        }
-
-        // Clear idle timeout
-        if (this.idleServerTimeout) {
-            clearTimeout(this.idleServerTimeout);
-            this.idleServerTimeout = null;
-        }
-
-        // Stop connection cleanup
-        if (this.connectionCleanupInterval) {
-            clearInterval(this.connectionCleanupInterval);
-            this.connectionCleanupInterval = null;
-        }
-
-        // Close all active connections
-        this.activeConnections.forEach((connection) => {
-            if (connection.socket && !connection.socket.destroyed) {
-                connection.socket.destroy();
-            }
-        });
-        this.activeConnections.clear();
-
-        // Close the server
-        this.callbackServer.close(() => {
-            this.addLog(`✅ Callback server stopped`);
-            this.callbackServer = null;
-            this.currentInstallation = null;
-        });
-    }
-
-    startConnectionCleanup() {
-        if (this.connectionCleanupInterval) {
-            clearInterval(this.connectionCleanupInterval);
-        }
-
-        this.connectionCleanupInterval = setInterval(() => {
-            const now = Date.now();
-            for (const [connectionId, connection] of this.activeConnections.entries()) {
-                // Close inactive connections (2 minutes)
-                if (now - connection.lastActivity > 120000) {
-                    this.addLog(`🧹 Cleaning up inactive connection: ${connectionId}`);
-                    if (connection.socket && !connection.socket.destroyed) {
-                        connection.socket.destroy();
-                    }
-                    this.activeConnections.delete(connectionId);
-                }
-            }
-        }, 60000);
-    }
-
-    startCacheCleanup() {
-        if (this.cacheCleanupInterval) {
-            clearInterval(this.cacheCleanupInterval);
-        }
-
-        this.cacheCleanupInterval = setInterval(() => {
-            try {
-                const files = fs.readdirSync(this.uploadDir);
-                const now = Date.now();
-                let cleaned = 0;
-
-                for (const file of files) {
-                    if (file.startsWith('cache_') && file.endsWith('.pkg')) {
-                        const filePath = path.join(this.uploadDir, file);
-                        const stats = fs.statSync(filePath);
-
-                        // Delete files older than 1 hour
-                        if (now - stats.mtimeMs > 3600000) {
-                            fs.unlinkSync(filePath);
-                            cleaned++;
-                        }
-                    }
-                }
-
-                if (cleaned > 0) {
-                    this.addLog(`🧹 Cache cleanup: removed ${cleaned} old files`);
-                }
-            } catch (error) {
-                console.error('Cache cleanup error:', error);
-            }
-        }, 3600000);
+        return installationId;
     }
 
     handlePS4Connection(socket, connectionId, installationId) {
-        // Update last activity
         const connection = this.activeConnections.get(connectionId);
-        if (connection) {
-            connection.lastActivity = Date.now();
-        }
+        const installation = this.activeInstallations.get(installationId);
 
-        if (!this.currentInstallation || this.currentInstallation.id !== installationId) {
-            this.addLog(`⚠️ Rejected connection (${connectionId}): Invalid installation`);
+        if (!installation) {
+            this.addLog(`⚠️ Invalid installation ID: ${installationId}`);
             socket.destroy();
             return;
         }
 
-        const installation = this.currentInstallation;
+        if (connection) {
+            connection.installationId = installationId;
+            connection.lastActivity = Date.now();
+        }
+
+        // Add connection to installation's connection set
+        installation.connections.add(connectionId);
 
         if (!installation.hasSentMetadata) {
+            // First connection - send metadata
             this.sendMetadata(socket, connectionId, installation);
             installation.hasSentMetadata = true;
-            installation.currentSocket = socket;
         } else if (!installation.isStreaming) {
-            // PS4 reconnected for data
-            installation.reconnectAttempts = 0;
-            this.addLog(`✅ PS4 requesting download data`);
+            // Second connection - acknowledge and let PS4 download
+            installation.isStreaming = true;
+            this.addLog(`✅ PS4 ${installationId} ready to download`);
 
-            // Send success response (0x01) - tells PS4 to start downloading
-            const response = Buffer.from([0x01]);
-            socket.write(response, (err) => {
+            // Send success byte
+            socket.write(Buffer.from([0x01]), (err) => {
                 if (err) {
-                    this.addLog(`❌ Failed to send response: ${err.message}`);
-                } else {
-                    this.addLog(`✅ Sent success response to PS4`);
-                    this.addLog(`📤 PS4 should now show "${installation.pkgInfo.title}" in downloads`);
+                    this.addLog(`❌ Failed to send ack: ${err.message}`);
                 }
                 socket.end();
             });
 
-            installation.isStreaming = true;
+            // Clean up installation after 5 minutes
+            setTimeout(() => {
+                if (this.activeInstallations.has(installationId)) {
+                    this.addLog(`🧹 Cleaning up completed installation: ${installationId}`);
+                    this.activeInstallations.delete(installationId);
+                }
+            }, 5 * 60 * 1000);
         } else {
-            this.addLog(`⚠️ Already streaming to another connection`);
-            socket.destroy();
+            // Already processed this installation
+            this.addLog(`ℹ️ Installation ${installationId} already processed`);
+            socket.end();
         }
     }
 
@@ -499,8 +417,8 @@ class DualRequestInstaller {
                 installation.pkgInfo
             );
 
-            this.addLog(`📤 Sending metadata (${metadata.length} bytes) to ${connectionId}`);
-            this.addLog(`   Title: ${installation.pkgInfo.title}`);
+            this.addLog(`📤 Sending metadata to ${connectionId} (${installation.id})`);
+            this.addLog(`   Game: ${installation.pkgInfo.title}`);
             this.addLog(`   Size: ${(installation.pkgSize / 1024 / 1024).toFixed(2)} MB`);
 
             socket.write(metadata, (err) => {
@@ -512,37 +430,59 @@ class DualRequestInstaller {
                 }
             });
         } catch (err) {
-            this.addLog(`❌ Metadata error for ${connectionId}: ${err.message}`);
+            this.addLog(`❌ Metadata error: ${err.message}`);
             socket.destroy();
         }
     }
 
-    safeDeleteFile(filePath) {
-        try {
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-                this.addLog(`🧹 Removed cache file: ${path.basename(filePath)}`);
+    getInstallationStatus(installationId) {
+        const installation = this.activeInstallations.get(installationId);
+        if (!installation) return null;
+
+        return {
+            id: installation.id,
+            title: installation.pkgInfo.title,
+            hasSentMetadata: installation.hasSentMetadata,
+            isStreaming: installation.isStreaming,
+            connections: Array.from(installation.connections),
+            age: Date.now() - installation.createdAt
+        };
+    }
+
+    cleanupInstallation(installationId) {
+        if (this.activeInstallations.has(installationId)) {
+            const installation = this.activeInstallations.get(installationId);
+
+            // Close all connections for this installation
+            for (const connectionId of installation.connections) {
+                const connection = this.activeConnections.get(connectionId);
+                if (connection && connection.socket && !connection.socket.destroyed) {
+                    connection.socket.destroy();
+                }
+                this.activeConnections.delete(connectionId);
             }
-        } catch (e) {
-            // Ignore cleanup errors
+
+            this.activeInstallations.delete(installationId);
+            this.addLog(`🧹 Cleaned up installation: ${installationId}`);
+            return true;
         }
+        return false;
     }
 }
 
-const installer = new DualRequestInstaller();
+const installer = new MultiUserInstaller();
 
-// API Routes only - no HTML serving
+// API Routes
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
-        environment: process.env.NODE_ENV || 'production',
-        serverIp: installer.pcIp,
-        port: PORT,
-        callbackPort: installer.callbackPort,
-        uptime: process.uptime(),
+        server: 'PS4 Multi-User Installer',
+        backend: 'https://nopsn-be.onrender.com',
+        frontend: 'http://nopsn-fe.free.nf',
+        activeInstallations: installer.activeInstallations.size,
         activeConnections: installer.activeConnections.size,
-        logsCount: installer.installationLog.length,
-        currentInstallation: installer.currentInstallation ? installer.currentInstallation.id : null
+        callbackPort: installer.callbackPort,
+        uptime: process.uptime()
     });
 });
 
@@ -575,7 +515,7 @@ app.post('/api/prepare-install', async (req, res) => {
             return res.status(400).json({ success: false, error: "No PKG URL provided" });
         }
 
-        installer.addLog(`📍 Install preparation request: ${pkgUrl}`);
+        installer.addLog(`📍 New installation request: ${pkgUrl}`);
 
         // Extract package info
         const extraction = await installer.extractPkgInfo(pkgUrl);
@@ -590,14 +530,11 @@ app.post('/api/prepare-install', async (req, res) => {
             pkgSize = 1024 * 1024 * 1024;
         }
 
-        // If extraction failed, use fallback metadata
+        // Use fallback metadata if extraction failed
         let finalInfo = extraction.bgftMetadata;
         if (extraction.success === false) {
-            // Generate fallback metadata from filename
             const filename = path.basename(pkgUrl);
             const baseName = filename.replace('.pkg', '').replace(/_/g, ' ').replace(/%20/g, ' ');
-
-            // Generate a fake but valid-looking Content ID and Title ID
             const randomNum = Date.now().toString().slice(-9);
             const contentId = `UP0000-CUSA${randomNum}_00-${baseName.toUpperCase().replace(/ /g, '')}`.substring(0, 36);
             const titleId = `CUSA${randomNum}`.substring(0, 9);
@@ -614,21 +551,21 @@ app.post('/api/prepare-install', async (req, res) => {
             installer.addLog(`⚠️ Using fallback metadata for: ${baseName}`);
         }
 
-        // Merge custom info if provided
+        // Merge custom info
         if (customInfo && typeof customInfo === 'object') {
             finalInfo = { ...finalInfo, ...customInfo };
-            installer.addLog(`⚙️ Custom metadata applied`);
         }
 
-        // Start callback server
-        installer.startCallbackServer(pkgUrl, pkgSize, finalInfo);
+        // Create installation
+        const installationId = installer.createInstallation(pkgUrl, pkgSize, finalInfo);
 
-        // Prepare payload
-        const payload = installer.preparePayload();
-        installer.addLog(`📦 Payload ready: ${payload.length} bytes`);
+        // Prepare payload with installation ID embedded
+        const payload = installer.preparePayload(installationId);
+        installer.addLog(`📦 Payload ready for ${installationId}: ${payload.length} bytes`);
 
         res.json({
             success: true,
+            installationId: installationId,
             payload: payload.toString('hex'),
             payloadSize: payload.length,
             packageSize: pkgSize,
@@ -637,7 +574,7 @@ app.post('/api/prepare-install', async (req, res) => {
             serverIp: installer.pcIp,
             callbackPort: installer.callbackPort,
             serverUrl: `https://${installer.pcIp}`,
-            installationId: installer.currentInstallation ? installer.currentInstallation.id : null
+            note: "Send this payload to your PS4. Each installation has a unique ID."
         });
     } catch (error) {
         installer.addLog(`❌ Install preparation failed: ${error.message}`);
@@ -645,34 +582,48 @@ app.post('/api/prepare-install', async (req, res) => {
     }
 });
 
-app.post('/api/stop-installation', async (req, res) => {
-    try {
-        installer.addLog(`🛑 Stopping current installation`);
-        installer.stopCallbackServer();
-        res.json({ success: true, message: 'Installation stopped' });
-    } catch (error) {
-        installer.addLog(`❌ Failed to stop installation: ${error.message}`);
-        res.status(500).json({ success: false, error: error.message });
+app.get('/api/installation/:id', (req, res) => {
+    const status = installer.getInstallationStatus(req.params.id);
+    if (status) {
+        res.json({ success: true, status: status });
+    } else {
+        res.status(404).json({ success: false, error: "Installation not found" });
     }
+});
+
+app.delete('/api/installation/:id', (req, res) => {
+    const cleaned = installer.cleanupInstallation(req.params.id);
+    res.json({ success: cleaned, message: cleaned ? "Installation cleaned up" : "Installation not found" });
+});
+
+app.get('/api/installations', (req, res) => {
+    const installations = [];
+    for (const [id, inst] of installer.activeInstallations.entries()) {
+        installations.push({
+            id: id,
+            title: inst.pkgInfo.title,
+            hasSentMetadata: inst.hasSentMetadata,
+            isStreaming: inst.isStreaming,
+            connections: inst.connections.size,
+            age: Date.now() - inst.createdAt
+        });
+    }
+    res.json({
+        success: true,
+        count: installations.length,
+        installations: installations
+    });
 });
 
 app.get('/api/logs', (req, res) => {
     const limit = parseInt(req.query.limit) || 100;
     const logs = installer.installationLog.slice(-limit);
-
     res.json({
         logs: logs,
         total: installer.installationLog.length,
         limit: limit,
-        serverIp: installer.pcIp,
-        activeConnections: installer.activeConnections.size,
-        currentInstallation: installer.currentInstallation ? {
-            id: installer.currentInstallation.id,
-            title: installer.currentInstallation.pkgInfo.title,
-            hasSentMetadata: installer.currentInstallation.hasSentMetadata,
-            isStreaming: installer.currentInstallation.isStreaming,
-            reconnectAttempts: installer.currentInstallation.reconnectAttempts
-        } : null
+        activeInstallations: installer.activeInstallations.size,
+        activeConnections: installer.activeConnections.size
     });
 });
 
@@ -683,58 +634,57 @@ app.delete('/api/logs', (req, res) => {
     res.json({ success: true, cleared: oldCount });
 });
 
-app.get('/api/info', (req, res) => {
+app.get('/api/stats', (req, res) => {
     res.json({
         server: {
             ip: installer.pcIp,
             port: PORT,
             callbackPort: installer.callbackPort,
-            uploadDir: installer.uploadDir,
             payloadExists: fs.existsSync(path.join(__dirname, 'payload.bin'))
         },
-        installation: installer.currentInstallation ? {
-            id: installer.currentInstallation.id,
-            title: installer.currentInstallation.pkgInfo.title,
-            size: installer.currentInstallation.pkgSize,
-            hasSentMetadata: installer.currentInstallation.hasSentMetadata,
-            isStreaming: installer.currentInstallation.isStreaming,
-            reconnectAttempts: installer.currentInstallation.reconnectAttempts
-        } : null,
-        connections: {
-            active: installer.activeConnections.size,
+        stats: {
+            activeInstallations: installer.activeInstallations.size,
+            activeConnections: installer.activeConnections.size,
+            totalLogs: installer.installationLog.length,
             callbackServer: installer.callbackServer ? 'Running' : 'Stopped'
         },
-        logs: {
-            count: installer.installationLog.length,
-            recent: installer.installationLog.slice(-5)
+        limits: {
+            maxConcurrentInstallations: 50, // You can adjust this
+            installationTimeout: "15 minutes",
+            connectionTimeout: "30 seconds"
         }
     });
 });
 
-// Simple root route that shows API info
 app.get('/', (req, res) => {
     res.json({
-        message: 'PS4 Direct Installer API Server',
+        message: 'PS4 Multi-User Direct Installer API',
+        version: '2.0',
         backend: 'https://nopsn-be.onrender.com',
         frontend: 'http://nopsn-fe.free.nf',
         endpoints: {
-            'GET /api/health': 'Server health check',
-            'GET /api/info': 'Server information',
-            'GET /api/logs': 'View installation logs',
+            'GET /': 'This info',
+            'GET /api/health': 'Server health',
+            'GET /api/stats': 'Server statistics',
+            'GET /api/installations': 'List active installations',
+            'GET /api/installation/:id': 'Get installation status',
+            'DELETE /api/installation/:id': 'Cleanup installation',
+            'GET /api/logs': 'View logs',
             'DELETE /api/logs': 'Clear logs',
             'POST /api/extract': 'Extract PKG metadata',
-            'POST /api/prepare-install': 'Prepare installation and get payload'
-        }
+            'POST /api/prepare-install': 'Create installation and get payload'
+        },
+        note: 'Supports multiple concurrent users. Each installation gets a unique ID.'
     });
 });
 
-// Error handling middleware
+// Error handling
 app.use((err, req, res, next) => {
     installer.addLog(`❌ Server error: ${err.message}`);
     console.error(err.stack);
     res.status(500).json({
         success: false,
-        error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
+        error: 'Internal server error'
     });
 });
 
@@ -744,59 +694,49 @@ app.use((req, res) => {
 
 // Start server
 const server = app.listen(PORT, () => {
-    console.log(`\n🚀 PS4 Direct Installer API Server (Backend Only)`);
-    console.log(`=============================================`);
+    console.log(`\n🚀 PS4 Multi-User Installer API Server`);
+    console.log(`======================================`);
     console.log(`🌐 Backend URL: https://nopsn-be.onrender.com`);
     console.log(`🎮 Frontend URL: http://nopsn-fe.free.nf`);
+    console.log(`👥 Supports: Multiple concurrent users`);
     console.log(`📞 Callback Port: ${installer.callbackPort}`);
-    console.log(`🔒 CORS Allowed: http://nopsn-fe.free.nf`);
+    console.log(`🔒 CORS: All origins allowed`);
     console.log(`Press Ctrl+C to stop`);
-    installer.addLog(`API Server started on https://${installer.pcIp}`);
+    installer.addLog(`Multi-user server started on https://${installer.pcIp}`);
 });
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
+process.on('SIGINT', () => {
     console.log('\n🔄 Shutting down gracefully...');
+    installer.addLog('Server shutting down...');
 
-    try {
-        installer.stopCallbackServer();
-
-        if (installer.cacheCleanupInterval) {
-            clearInterval(installer.cacheCleanupInterval);
+    // Close all connections
+    for (const connection of installer.activeConnections.values()) {
+        if (connection.socket && !connection.socket.destroyed) {
+            connection.socket.destroy();
         }
-
-        server.close(() => {
-            console.log('✅ Server stopped');
-            process.exit(0);
-        });
-
-        setTimeout(() => {
-            console.log('⚠️ Forcing shutdown...');
-            process.exit(1);
-        }, 5000);
-
-    } catch (error) {
-        console.error('Shutdown error:', error);
-        process.exit(1);
     }
-});
 
-process.on('SIGTERM', async () => {
-    console.log('\n🔻 Received SIGTERM, shutting down...');
-    installer.stopCallbackServer();
+    // Close callback server
+    if (installer.callbackServer) {
+        installer.callbackServer.close();
+    }
+
     server.close(() => {
+        console.log('✅ Server stopped');
         process.exit(0);
     });
+
+    setTimeout(() => {
+        console.log('⚠️ Forcing shutdown...');
+        process.exit(1);
+    }, 5000);
 });
 
-process.on('uncaughtException', (error) => {
-    console.error('❌ Uncaught Exception:', error);
-    installer.addLog(`❌ Uncaught Exception: ${error.message}`);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-    installer.addLog(`❌ Unhandled Rejection: ${reason}`);
+process.on('SIGTERM', () => {
+    console.log('\n🔻 Received SIGTERM, shutting down...');
+    if (installer.callbackServer) installer.callbackServer.close();
+    server.close(() => process.exit(0));
 });
 
 module.exports = { app, installer };
