@@ -22,8 +22,8 @@ app.use(express.json({ limit: '10mb' }));
 class MultiUserInstaller {
     constructor() {
         this.installationLog = [];
-        this.activeInstallations = new Map(); // installationId -> installation
-        this.activeConnections = new Map(); // connectionId -> connection
+        this.activeInstallations = new Map();
+        this.activeConnections = new Map();
         this.callbackServer = null;
         this.uploadDir = path.join(__dirname, 'uploads');
         this.pcIp = this.getDeploymentIp();
@@ -100,12 +100,11 @@ class MultiUserInstaller {
         ipBytes.copy(payload, offset);
         portBytes.copy(payload, offset + 4);
 
-        // Embed installation ID in payload (append after placeholder area)
+        // Embed installation ID
         const idData = Buffer.from(`${installationId}\0`, 'utf-8');
         const idMaxLength = 64;
         const idLength = Math.min(idData.length, idMaxLength);
 
-        // Find a safe place to embed (look for null bytes after the placeholder)
         let embedOffset = offset + 6;
         while (embedOffset < payload.length && payload[embedOffset] !== 0x00 && embedOffset < offset + 100) {
             embedOffset++;
@@ -113,9 +112,7 @@ class MultiUserInstaller {
 
         if (embedOffset + idLength <= payload.length) {
             idData.copy(payload, embedOffset, 0, idLength);
-            this.addLog(`📋 Embedded installation ID: ${installationId} at offset ${embedOffset}`);
-        } else {
-            this.addLog(`⚠️ Could not embed installation ID in payload`);
+            this.addLog(`📋 Embedded installation ID: ${installationId}`);
         }
 
         return payload;
@@ -213,7 +210,7 @@ class MultiUserInstaller {
         const contentIdData = Buffer.from(pkgInfo.contentId || 'UP0000-CUSA00000_00-GAME0000000000', 'utf-8');
         const titleIdData = Buffer.from(pkgInfo.titleId || 'CUSA00000', 'utf-8');
 
-        let totalSize = 16; // Magic + Version + FileSize
+        let totalSize = 16;
         totalSize += 4 + urlData.length;
         totalSize += 4 + nameData.length;
         totalSize += 4 + contentIdData.length;
@@ -260,6 +257,131 @@ class MultiUserInstaller {
         return packet;
     }
 
+    // ADD THIS MISSING METHOD:
+    startOrGetCallbackServer() {
+        if (!this.callbackServer) {
+            this.callbackServer = net.createServer((socket) => {
+                const connectionId = `conn_${Date.now()}_${++this.connectionCounter}`;
+
+                // Store connection
+                const connection = {
+                    socket: socket,
+                    connectionId: connectionId,
+                    startTime: Date.now(),
+                    installationId: null,
+                    lastActivity: Date.now()
+                };
+                this.activeConnections.set(connectionId, connection);
+
+                socket.setTimeout(30000);
+
+                socket.on('timeout', () => {
+                    this.addLog(`⏰ Socket timeout (${connectionId})`);
+                    socket.destroy();
+                });
+
+                socket.on('error', (err) => {
+                    this.addLog(`❌ Socket error (${connectionId}): ${err.message}`);
+                    this.activeConnections.delete(connectionId);
+                });
+
+                socket.on('close', () => {
+                    const conn = this.activeConnections.get(connectionId);
+                    if (conn) {
+                        const duration = (Date.now() - conn.startTime) / 1000;
+                        this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s`);
+                    }
+                    this.activeConnections.delete(connectionId);
+                });
+
+                // Handle incoming data
+                socket.once('data', (data) => {
+                    try {
+                        connection.lastActivity = Date.now();
+
+                        let installationId = null;
+
+                        // Method 1: Check if data contains installation ID
+                        if (data.length >= 5) {
+                            const potentialId = data.toString('utf-8', 0, Math.min(data.length, 32)).trim();
+                            if (potentialId.length > 5 && potentialId.startsWith('inst_')) {
+                                installationId = potentialId.split(/[^\w_]/)[0];
+                            }
+                        }
+
+                        // Method 2: Find an installation that hasn't sent metadata yet
+                        if (!installationId) {
+                            for (const [id, inst] of this.activeInstallations.entries()) {
+                                if (!inst.hasSentMetadata) {
+                                    installationId = id;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (installationId && this.activeInstallations.has(installationId)) {
+                            connection.installationId = installationId;
+                            this.addLog(`📡 Connection ${connectionId} → Installation: ${installationId}`);
+                            this.handlePS4Connection(socket, connectionId, installationId);
+                        } else {
+                            this.addLog(`⚠️ No installation found for ${connectionId}`);
+                            socket.write(Buffer.from([0x01]));
+                            socket.end();
+                        }
+                    } catch (err) {
+                        this.addLog(`❌ Connection handler error: ${err.message}`);
+                        socket.destroy();
+                    }
+                });
+
+            }).listen(this.callbackPort, () => {
+                this.addLog(`🎯 Callback server listening on port ${this.callbackPort}`);
+            });
+
+            this.callbackServer.on('error', (err) => {
+                this.addLog(`❌ Callback server error: ${err.message}`);
+            });
+
+            // Cleanup old installations every minute
+            setInterval(() => {
+                const now = Date.now();
+                for (const [installationId, installation] of this.activeInstallations.entries()) {
+                    if (now - installation.createdAt > 15 * 60 * 1000) {
+                        this.addLog(`🧹 Cleaning up old installation: ${installationId}`);
+                        this.activeInstallations.delete(installationId);
+                    }
+                }
+            }, 60000);
+        }
+
+        return this.callbackServer;
+    }
+
+    // ADD THIS METHOD TOO:
+    createInstallation(pkgUrl, pkgSize, pkgInfo) {
+        const installationId = `inst_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
+
+        const installation = {
+            id: installationId,
+            pkgUrl: pkgUrl,
+            pkgSize: pkgSize,
+            pkgInfo: pkgInfo,
+            hasSentMetadata: false,
+            isStreaming: false,
+            createdAt: Date.now(),
+            connections: new Set()
+        };
+
+        this.activeInstallations.set(installationId, installation);
+        this.addLog(`📦 Created installation: ${installationId} for "${pkgInfo.title}"`);
+
+        // Ensure callback server is running
+        this.startOrGetCallbackServer();
+
+        return installationId;
+    }
+
+    // ADD THIS METHOD:
     handlePS4Connection(socket, connectionId, installationId) {
         const connection = this.activeConnections.get(connectionId);
         const installation = this.activeInstallations.get(installationId);
@@ -305,7 +427,7 @@ class MultiUserInstaller {
                     this.addLog(`🧹 Cleaning up completed installation: ${installationId}`);
                     this.activeInstallations.delete(installationId);
                 }
-            }, 300000); // 5 minutes
+            }, 300000);
         } else {
             // Already processed
             this.addLog(`ℹ️ Installation ${installationId} already processed`);
@@ -313,78 +435,7 @@ class MultiUserInstaller {
         }
     }
 
-    createInstallation(pkgUrl, pkgSize, pkgInfo) {
-        const installationId = `inst_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
-
-        const installation = {
-            id: installationId,
-            pkgUrl: pkgUrl,
-            pkgSize: pkgSize,
-            pkgInfo: pkgInfo,
-            hasSentMetadata: false,
-            isStreaming: false,
-            createdAt: Date.now(),
-            connections: new Set()
-        };
-
-        this.activeInstallations.set(installationId, installation);
-        this.addLog(`📦 Created installation: ${installationId} for "${pkgInfo.title}"`);
-
-        // Ensure callback server is running
-        this.startOrGetCallbackServer();
-
-        return installationId;
-    }
-
-    handlePS4Connection(socket, connectionId, installationId) {
-        const connection = this.activeConnections.get(connectionId);
-        const installation = this.activeInstallations.get(installationId);
-
-        if (!installation) {
-            this.addLog(`⚠️ Invalid installation ID: ${installationId}`);
-            socket.destroy();
-            return;
-        }
-
-        if (connection) {
-            connection.installationId = installationId;
-            connection.lastActivity = Date.now();
-        }
-
-        // Add connection to installation's connection set
-        installation.connections.add(connectionId);
-
-        if (!installation.hasSentMetadata) {
-            // First connection - send metadata
-            this.sendMetadata(socket, connectionId, installation);
-            installation.hasSentMetadata = true;
-        } else if (!installation.isStreaming) {
-            // Second connection - acknowledge and let PS4 download
-            installation.isStreaming = true;
-            this.addLog(`✅ PS4 ${installationId} ready to download`);
-
-            // Send success byte
-            socket.write(Buffer.from([0x01]), (err) => {
-                if (err) {
-                    this.addLog(`❌ Failed to send ack: ${err.message}`);
-                }
-                socket.end();
-            });
-
-            // Clean up installation after 5 minutes
-            setTimeout(() => {
-                if (this.activeInstallations.has(installationId)) {
-                    this.addLog(`🧹 Cleaning up completed installation: ${installationId}`);
-                    this.activeInstallations.delete(installationId);
-                }
-            }, 5 * 60 * 1000);
-        } else {
-            // Already processed this installation
-            this.addLog(`ℹ️ Installation ${installationId} already processed`);
-            socket.end();
-        }
-    }
-
+    // ADD THIS METHOD:
     sendMetadata(socket, connectionId, installation) {
         try {
             const metadata = this.buildMetadataPacket(
@@ -397,7 +448,6 @@ class MultiUserInstaller {
             this.addLog(`   Game: ${installation.pkgInfo.title}`);
             this.addLog(`   Content ID: ${installation.pkgInfo.contentId}`);
             this.addLog(`   Size: ${(installation.pkgSize / 1024 / 1024).toFixed(2)} MB`);
-            this.addLog(`   URL: ${installation.pkgUrl.substring(0, 80)}...`);
 
             socket.write(metadata, (err) => {
                 if (err) {
@@ -414,6 +464,7 @@ class MultiUserInstaller {
         }
     }
 
+    // ADD THESE HELPER METHODS:
     getInstallationStatus(installationId) {
         const installation = this.activeInstallations.get(installationId);
         if (!installation) return null;
@@ -432,7 +483,6 @@ class MultiUserInstaller {
         if (this.activeInstallations.has(installationId)) {
             const installation = this.activeInstallations.get(installationId);
 
-            // Close all connections for this installation
             for (const connectionId of installation.connections) {
                 const connection = this.activeConnections.get(connectionId);
                 if (connection && connection.socket && !connection.socket.destroyed) {
