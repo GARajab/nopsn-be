@@ -35,23 +35,22 @@ class DualRequestInstaller {
         // Initialize extractor
         this.extractor = new PKGExtractor();
 
-        // NOW get deployment IP (which will use addLog)
+        // Get deployment IP for Render
         this.pcIp = this.getDeploymentIp();
-        this.callbackPort = parseInt(process.env.CALLBACK_PORT) || 9022;
+        this.callbackPort = 9022; // Fixed port for Render
 
         // Start cache cleanup
         this.startCacheCleanup();
 
-        this.addLog(`✅ DualRequestInstaller initialized`);
+        this.addLog(`✅ DualRequestInstaller initialized on ${this.pcIp}:${this.callbackPort}`);
     }
 
     getDeploymentIp() {
-        // For Render.com deployment, use the public domain
+        // For Render.com, use the public URL
         if (process.env.RENDER_EXTERNAL_URL) {
-            // Extract hostname from Render URL
-            const url = process.env.RENDER_EXTERNAL_URL.replace('https://', '').replace('http://', '');
+            const url = process.env.RENDER_EXTERNAL_URL;
             this.addLog(`🌐 Using Render URL: ${url}`);
-            return url;
+            return url.replace('https://', '').replace('http://', '').split(':')[0];
         }
 
         // Check for explicit PUBLIC_IP or SERVER_DOMAIN env vars
@@ -65,7 +64,7 @@ class DualRequestInstaller {
             return process.env.SERVER_DOMAIN;
         }
 
-        // Fallback to local IP detection
+        // For local development
         return this.getLocalIp();
     }
 
@@ -95,35 +94,6 @@ class DualRequestInstaller {
         if (this.installationLog.length > 1000) {
             this.installationLog = this.installationLog.slice(-1000);
         }
-    }
-
-    async isPortAvailable(port) {
-        return new Promise((resolve) => {
-            const server = net.createServer();
-            server.once('error', (err) => {
-                if (err.code === 'EADDRINUSE') {
-                    this.addLog(`⚠️ Port ${port} is in use`);
-                    resolve(false);
-                } else {
-                    resolve(false);
-                }
-            });
-            server.once('listening', () => {
-                server.close();
-                resolve(true);
-            });
-            server.listen(port);
-        });
-    }
-
-    async findAvailablePort(startPort, maxAttempts = 10) {
-        for (let i = 0; i < maxAttempts; i++) {
-            const port = startPort + i;
-            if (await this.isPortAvailable(port)) {
-                return port;
-            }
-        }
-        throw new Error(`No available ports found between ${startPort} and ${startPort + maxAttempts - 1}`);
     }
 
     preparePayload() {
@@ -248,82 +218,73 @@ class DualRequestInstaller {
     }
 
     buildMetadataPacket(pkgUrl, pkgSize, pkgInfo) {
-        const contentId = pkgInfo.contentId || 'UNKNOWN00000';
-        const bgftType = pkgInfo.type || '1';
-        const title = pkgInfo.title || 'Package';
-        const hasIcon = pkgInfo.icon && pkgInfo.icon.length > 0;
-
+        // BGFT format for PS4
         const urlData = Buffer.from(pkgUrl, 'utf-8');
-        const nameData = Buffer.from(title, 'utf-8');
-        const idData = Buffer.from(contentId, 'utf-8');
-        const typeData = Buffer.from(bgftType, 'utf-8');
+        const nameData = Buffer.from(pkgInfo.title || 'Game', 'utf-8');
+        const contentIdData = Buffer.from(pkgInfo.contentId || 'UP0000-CUSA00000_00-GAME0000000000', 'utf-8');
+        const titleIdData = Buffer.from(pkgInfo.titleId || 'CUSA00000', 'utf-8');
 
-        let totalSize = 4 + 4 + urlData.length + 4 + nameData.length +
-            4 + idData.length + 4 + typeData.length + 8 + 4;
-
-        let iconData = Buffer.alloc(0);
-        if (hasIcon) {
-            iconData = Buffer.from(pkgInfo.icon, 'base64');
-            totalSize += iconData.length;
-        }
+        // Calculate total size
+        let totalSize = 16; // Magic (4) + Version (4) + FileSize (8)
+        totalSize += 4 + urlData.length;
+        totalSize += 4 + nameData.length;
+        totalSize += 4 + contentIdData.length;
+        totalSize += 4 + titleIdData.length;
 
         const packet = Buffer.alloc(totalSize);
         let offset = 0;
 
-        const version = hasIcon ? 2 : 1;
-        packet.writeUInt32LE(version, offset);
+        // Magic: "GBFT" (0x47424654)
+        packet.writeUInt32LE(0x47424654, offset);
         offset += 4;
 
+        // Version: 1
+        packet.writeUInt32LE(1, offset);
+        offset += 4;
+
+        // URL
         packet.writeUInt32LE(urlData.length, offset);
         offset += 4;
         urlData.copy(packet, offset);
         offset += urlData.length;
 
+        // Title
         packet.writeUInt32LE(nameData.length, offset);
         offset += 4;
         nameData.copy(packet, offset);
         offset += nameData.length;
 
-        packet.writeUInt32LE(idData.length, offset);
+        // Content ID
+        packet.writeUInt32LE(contentIdData.length, offset);
         offset += 4;
-        idData.copy(packet, offset);
-        offset += idData.length;
+        contentIdData.copy(packet, offset);
+        offset += contentIdData.length;
 
-        packet.writeUInt32LE(typeData.length, offset);
+        // Title ID
+        packet.writeUInt32LE(titleIdData.length, offset);
         offset += 4;
-        typeData.copy(packet, offset);
-        offset += typeData.length;
+        titleIdData.copy(packet, offset);
+        offset += titleIdData.length;
 
+        // File size (64-bit little endian)
         packet.writeBigUInt64LE(BigInt(pkgSize), offset);
-        offset += 8;
 
-        if (hasIcon) {
-            packet.writeUInt32LE(iconData.length, offset);
-            offset += 4;
-            iconData.copy(packet, offset);
-            this.addLog(`🖼️ Icon included: ${(iconData.length / 1024).toFixed(2)} KB`);
-        } else {
-            packet.writeUInt32LE(0, offset);
-        }
+        this.addLog(`📦 Built BGFT packet: ${packet.length} bytes`);
+        this.addLog(`   Title: "${pkgInfo.title || 'Game'}"`);
+        this.addLog(`   Content ID: ${pkgInfo.contentId}`);
+        this.addLog(`   Size: ${(pkgSize / 1024 / 1024).toFixed(2)} MB`);
 
         return packet;
     }
 
-    async startCallbackServer(pkgUrl, pkgSize, pkgInfo) {
-        // Cleanup any existing server
+    startCallbackServer(pkgUrl, pkgSize, pkgInfo) {
+        // Close existing server if running
         if (this.callbackServer) {
             this.addLog(`🔄 Stopping existing callback server...`);
-            await this.stopCallbackServer();
+            this.stopCallbackServer();
         }
 
-        // Try to find an available port
-        try {
-            this.callbackPort = await this.findAvailablePort(this.callbackPort);
-            this.addLog(`✅ Using port ${this.callbackPort} for callback server`);
-        } catch (error) {
-            throw new Error(`Failed to find available port: ${error.message}`);
-        }
-
+        // Create installation session
         const installationId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
         this.currentInstallation = {
             id: installationId,
@@ -339,114 +300,92 @@ class DualRequestInstaller {
 
         this.addLog(`📦 Starting installation: ${installationId}`);
 
-        return new Promise((resolve, reject) => {
-            this.callbackServer = net.createServer((socket) => {
-                const connectionId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+        this.callbackServer = net.createServer((socket) => {
+            const connectionId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
 
-                this.activeConnections.set(connectionId, {
-                    socket: socket,
-                    installationId: installationId,
-                    connectionId: connectionId,
-                    startTime: Date.now(),
-                    bytesStreamed: 0,
-                    lastActivity: Date.now()
-                });
-
-                // Set socket timeout
-                socket.setTimeout(120000);
-
-                socket.on('timeout', () => {
-                    this.addLog(`⏰ Socket timeout (${connectionId})`);
-                    socket.destroy();
-                });
-
-                socket.on('error', (err) => {
-                    this.addLog(`❌ Socket error (${connectionId}): ${err.message}`);
-                    this.activeConnections.delete(connectionId);
-                });
-
-                socket.on('close', () => {
-                    const connection = this.activeConnections.get(connectionId);
-                    if (connection) {
-                        const duration = (Date.now() - connection.startTime) / 1000;
-                        this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s`);
-                    }
-                    this.activeConnections.delete(connectionId);
-                });
-
-                this.handlePS4Connection(socket, connectionId, installationId);
-
+            this.activeConnections.set(connectionId, {
+                socket: socket,
+                installationId: installationId,
+                connectionId: connectionId,
+                startTime: Date.now(),
+                bytesStreamed: 0,
+                lastActivity: Date.now()
             });
 
-            this.callbackServer.on('error', (err) => {
-                this.addLog(`❌ Callback server error: ${err.message}`);
-                reject(err);
+            // Set socket timeout
+            socket.setTimeout(120000);
+
+            socket.on('timeout', () => {
+                this.addLog(`⏰ Socket timeout (${connectionId})`);
+                socket.destroy();
             });
 
-            this.callbackServer.on('listening', () => {
-                this.addLog(`🎯 Callback server listening on port ${this.callbackPort}`);
-                resolve();
+            socket.on('error', (err) => {
+                this.addLog(`❌ Socket error (${connectionId}): ${err.message}`);
+                this.activeConnections.delete(connectionId);
             });
 
-            this.callbackServer.listen(this.callbackPort);
-
-            // Start connection cleanup interval
-            this.startConnectionCleanup();
-
-            // Auto-close idle server after 10 minutes
-            this.idleServerTimeout = setTimeout(() => {
-                if (this.callbackServer && this.activeConnections.size === 0) {
-                    this.addLog(`🔄 Auto-closing idle server`);
-                    this.stopCallbackServer();
+            socket.on('close', () => {
+                const connection = this.activeConnections.get(connectionId);
+                if (connection) {
+                    const duration = (Date.now() - connection.startTime) / 1000;
+                    this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s`);
                 }
-            }, 10 * 60 * 1000);
+                this.activeConnections.delete(connectionId);
+            });
+
+            this.handlePS4Connection(socket, connectionId, installationId);
+
+        }).listen(this.callbackPort, () => {
+            this.addLog(`🎯 Callback server listening on port ${this.callbackPort}`);
         });
+
+        this.callbackServer.on('error', (err) => {
+            this.addLog(`❌ Callback server error: ${err.message}`);
+        });
+
+        // Start connection cleanup
+        this.startConnectionCleanup();
+
+        // Auto-close idle server after 10 minutes
+        this.idleServerTimeout = setTimeout(() => {
+            if (this.callbackServer && this.activeConnections.size === 0) {
+                this.addLog(`🔄 Auto-closing idle server`);
+                this.stopCallbackServer();
+            }
+        }, 10 * 60 * 1000);
     }
 
-    async stopCallbackServer() {
-        return new Promise((resolve) => {
-            if (!this.callbackServer) {
-                resolve();
-                return;
+    stopCallbackServer() {
+        if (!this.callbackServer) {
+            return;
+        }
+
+        // Clear idle timeout
+        if (this.idleServerTimeout) {
+            clearTimeout(this.idleServerTimeout);
+            this.idleServerTimeout = null;
+        }
+
+        // Stop connection cleanup
+        if (this.connectionCleanupInterval) {
+            clearInterval(this.connectionCleanupInterval);
+            this.connectionCleanupInterval = null;
+        }
+
+        // Close all active connections
+        this.activeConnections.forEach((connection) => {
+            if (connection.socket && !connection.socket.destroyed) {
+                connection.socket.destroy();
             }
+        });
+        this.activeConnections.clear();
 
-            // Clear idle timeout
-            if (this.idleServerTimeout) {
-                clearTimeout(this.idleServerTimeout);
-                this.idleServerTimeout = null;
-            }
-
-            // Stop connection cleanup
-            if (this.connectionCleanupInterval) {
-                clearInterval(this.connectionCleanupInterval);
-                this.connectionCleanupInterval = null;
-            }
-
-            // Close all active connections
-            this.activeConnections.forEach((connection) => {
-                if (connection.socket && !connection.socket.destroyed) {
-                    connection.socket.destroy();
-                }
-            });
-            this.activeConnections.clear();
-
-            // Close the server
-            this.callbackServer.close(() => {
-                this.addLog(`✅ Callback server stopped`);
-                this.callbackServer = null;
-                this.currentInstallation = null;
-                resolve();
-            });
-
-            // Force close after 5 seconds
-            setTimeout(() => {
-                if (this.callbackServer) {
-                    this.callbackServer.close();
-                    this.callbackServer = null;
-                    this.currentInstallation = null;
-                }
-                resolve();
-            }, 5000);
+        // Close the server
+        this.callbackServer.close(() => {
+            this.addLog(`✅ Callback server stopped`);
+            this.callbackServer = null;
+            this.currentInstallation = null;
         });
     }
 
@@ -467,7 +406,7 @@ class DualRequestInstaller {
                     this.activeConnections.delete(connectionId);
                 }
             }
-        }, 60000); // Run every minute
+        }, 60000);
     }
 
     startCacheCleanup() {
@@ -500,7 +439,7 @@ class DualRequestInstaller {
             } catch (error) {
                 console.error('Cache cleanup error:', error);
             }
-        }, 3600000); // Run every hour
+        }, 3600000);
     }
 
     handlePS4Connection(socket, connectionId, installationId) {
@@ -523,20 +462,26 @@ class DualRequestInstaller {
             installation.hasSentMetadata = true;
             installation.currentSocket = socket;
         } else if (!installation.isStreaming) {
-            // Reset reconnect attempts on successful connection
+            // PS4 reconnected for data
             installation.reconnectAttempts = 0;
+            this.addLog(`✅ PS4 requesting download data`);
 
-            this.addLog(`✅ PS4 reconnected for data`);
-            installation.currentSocket = socket;
+            // Send success response (0x01) - tells PS4 to start downloading
+            const response = Buffer.from([0x01]);
+            socket.write(response, (err) => {
+                if (err) {
+                    this.addLog(`❌ Failed to send response: ${err.message}`);
+                } else {
+                    this.addLog(`✅ Sent success response to PS4`);
+                    this.addLog(`📤 PS4 should now show "${installation.pkgInfo.title}" in downloads`);
+                }
+                socket.end();
+            });
+
             installation.isStreaming = true;
-
-            // COMMENT OUT or CHANGE this line:
-            // this.streamPackageData(socket, connectionId, installation);
-
-            // INSTEAD, just acknowledge and let PS4 download:
-            this.addLog(`✅ PS4 acknowledged - it should now download directly`);
-            socket.write(Buffer.from([0x01])); // Send success byte
-            socket.end();
+        } else {
+            this.addLog(`⚠️ Already streaming to another connection`);
+            socket.destroy();
         }
     }
 
@@ -565,208 +510,6 @@ class DualRequestInstaller {
             socket.destroy();
         }
     }
-
-    streamPackageData(socket, connectionId, installation) {
-        this.addLog(`✅ PS4 ready to download directly from source`);
-
-        // Don't download on server - just close connection
-        // The PS4 will download directly from the URL we sent in metadata
-        installation.currentSocket = null;
-        installation.isStreaming = false;
-
-        // PS4 will now download directly from the URL
-        this.addLog(`📤 PS4 should now download directly from: ${installation.pkgUrl}`);
-
-        // Clean up after timeout
-        setTimeout(() => {
-            if (!installation.isStreaming) {
-                this.addLog(`🔄 Installation completed or timed out`);
-            }
-        }, 60000); // 1 minute timeout
-    }
-
-    // async downloadPackageToLocalCache(installation) {
-    //     return new Promise((resolve, reject) => {
-    //         const parsedUrl = new URL(installation.pkgUrl);
-    //         const protocol = parsedUrl.protocol === 'https:' ? https : http;
-
-    //         const cacheFilename = `cache_${installation.id}.pkg`;
-    //         const cachePath = path.join(this.uploadDir, cacheFilename);
-
-    //         this.addLog(`📥 Downloading to cache: ${cacheFilename}`);
-
-    //         const options = {
-    //             hostname: parsedUrl.hostname,
-    //             port: parsedUrl.port,
-    //             path: parsedUrl.pathname + parsedUrl.search,
-    //             timeout: 120000, // 2 minute timeout
-    //             headers: {
-    //                 'User-Agent': 'PS4-Installer/1.0',
-    //                 'Accept-Encoding': 'identity' // No compression for accurate progress
-    //             }
-    //         };
-
-    //         const req = protocol.get(options, (res) => {
-    //             if (res.statusCode !== 200) {
-    //                 reject(new Error(`HTTP ${res.statusCode}`));
-    //                 return;
-    //             }
-
-    //             const fileStream = fs.createWriteStream(cachePath);
-    //             const contentLength = parseInt(res.headers['content-length'] || '0', 10);
-    //             let downloaded = 0;
-    //             let lastLog = Date.now();
-
-    //             res.pipe(fileStream);
-
-    //             res.on('data', (chunk) => {
-    //                 downloaded += chunk.length;
-    //                 const now = Date.now();
-    //                 if (now - lastLog > 5000) {
-    //                     const percent = contentLength > 0 ?
-    //                         ((downloaded / contentLength) * 100).toFixed(1) : '??';
-    //                     this.addLog(`📊 ${(downloaded / 1024 / 1024).toFixed(2)}MB (${percent}%)`);
-    //                     lastLog = now;
-    //                 }
-    //             });
-
-    //             fileStream.on('finish', () => {
-    //                 fileStream.close();
-    //                 this.addLog(`✅ Download complete: ${(downloaded / 1024 / 1024).toFixed(2)}MB`);
-    //                 resolve(cachePath);
-    //             });
-
-    //             fileStream.on('error', (err) => {
-    //                 fileStream.destroy();
-    //                 try { fs.unlinkSync(cachePath); } catch (e) { }
-    //                 reject(new Error(`File write error: ${err.message}`));
-    //             });
-
-    //             res.on('error', (err) => {
-    //                 fileStream.destroy();
-    //                 try { fs.unlinkSync(cachePath); } catch (e) { }
-    //                 reject(new Error(`Download error: ${err.message}`));
-    //             });
-    //         });
-
-    //         req.on('error', (err) => {
-    //             reject(new Error(`Request error: ${err.message}`));
-    //         });
-
-    //         req.setTimeout(120000, () => {
-    //             req.destroy();
-    //             reject(new Error('Download timeout'));
-    //         });
-    //     });
-    // }
-
-    // waitForPS4Reconnection(installation, localPath) {
-    //     const reconnectTimeout = setTimeout(() => {
-    //         this.addLog(`❌ PS4 didn't reconnect within timeout`);
-    //         installation.isStreaming = false;
-    //         try {
-    //             if (fs.existsSync(localPath)) {
-    //                 fs.unlinkSync(localPath);
-    //                 this.addLog(`🧹 Removed cache file: ${path.basename(localPath)}`);
-    //             }
-    //         } catch (e) {
-    //             // Ignore cleanup errors
-    //         }
-    //     }, 45000); // 45 second timeout
-
-    //     const checkInterval = setInterval(() => {
-    //         if (installation.currentSocket &&
-    //             !installation.currentSocket.destroyed &&
-    //             installation.currentSocket.writable) {
-
-    //             clearTimeout(reconnectTimeout);
-    //             clearInterval(checkInterval);
-    //             this.streamFromCache(installation.currentSocket, localPath, installation);
-    //             return;
-    //         }
-
-    //         if (!installation.isStreaming) {
-    //             clearTimeout(reconnectTimeout);
-    //             clearInterval(checkInterval);
-    //             try {
-    //                 if (fs.existsSync(localPath)) {
-    //                     fs.unlinkSync(localPath);
-    //                 }
-    //             } catch (e) {
-    //                 // Ignore cleanup errors
-    //             }
-    //         }
-    //     }, 1000);
-    // }
-
-    // streamFromCache(socket, cachePath, installation) {
-    //     try {
-    //         if (!fs.existsSync(cachePath)) {
-    //             throw new Error(`Cache file not found: ${cachePath}`);
-    //         }
-
-    //         const fileSize = fs.statSync(cachePath).size;
-    //         const fileStream = fs.createReadStream(cachePath);
-
-    //         this.addLog(`📤 Streaming from cache: ${(fileSize / 1024 / 1024).toFixed(2)}MB`);
-
-    //         let streamed = 0;
-    //         let lastLog = Date.now();
-
-    //         fileStream.on('data', (chunk) => {
-    //             streamed += chunk.length;
-
-    //             const canWrite = socket.write(chunk);
-    //             if (!canWrite) {
-    //                 fileStream.pause();
-    //                 socket.once('drain', () => fileStream.resume());
-    //             }
-
-    //             const now = Date.now();
-    //             if (now - lastLog > 5000) {
-    //                 const percent = ((streamed / fileSize) * 100).toFixed(1);
-    //                 this.addLog(`📦 ${(streamed / 1024 / 1024).toFixed(2)}MB (${percent}%)`);
-    //                 lastLog = now;
-    //             }
-    //         });
-
-    //         fileStream.on('end', () => {
-    //             this.addLog(`✅ Stream complete!`);
-    //             setTimeout(() => {
-    //                 if (!socket.destroyed) {
-    //                     socket.end();
-    //                 }
-    //             }, 1000);
-
-    //             // Cleanup cache file
-    //             this.safeDeleteFile(cachePath);
-    //         });
-
-    //         fileStream.on('error', (err) => {
-    //             this.addLog(`❌ Stream error: ${err.message}`);
-    //             socket.destroy();
-    //             this.safeDeleteFile(cachePath);
-    //         });
-
-    //         socket.on('error', (err) => {
-    //             this.addLog(`❌ Socket error during streaming: ${err.message}`);
-    //             fileStream.destroy();
-    //             this.safeDeleteFile(cachePath);
-    //         });
-
-    //         socket.on('close', () => {
-    //             fileStream.destroy();
-    //             this.safeDeleteFile(cachePath);
-    //             installation.isStreaming = false;
-    //         });
-
-    //     } catch (err) {
-    //         this.addLog(`❌ Streaming setup error: ${err.message}`);
-    //         socket.destroy();
-    //         this.safeDeleteFile(cachePath);
-    //         installation.isStreaming = false;
-    //     }
-    // }
 
     safeDeleteFile(filePath) {
         try {
@@ -841,15 +584,38 @@ app.post('/api/prepare-install', async (req, res) => {
             pkgSize = 1024 * 1024 * 1024;
         }
 
-        // Merge custom info if provided
+        // If extraction failed, use fallback metadata
         let finalInfo = extraction.bgftMetadata;
+        if (extraction.success === false) {
+            // Generate fallback metadata from filename
+            const filename = path.basename(pkgUrl);
+            const baseName = filename.replace('.pkg', '').replace(/_/g, ' ').replace(/%20/g, ' ');
+
+            // Generate a fake but valid-looking Content ID and Title ID
+            const randomNum = Date.now().toString().slice(-9);
+            const contentId = `UP0000-CUSA${randomNum}_00-${baseName.toUpperCase().replace(/ /g, '')}`.substring(0, 36);
+            const titleId = `CUSA${randomNum}`.substring(0, 9);
+
+            finalInfo = {
+                title: baseName || 'Unknown Game',
+                contentId: contentId,
+                titleId: titleId,
+                type: '1',
+                category: 'gd',
+                icon: null
+            };
+
+            installer.addLog(`⚠️ Using fallback metadata for: ${baseName}`);
+        }
+
+        // Merge custom info if provided
         if (customInfo && typeof customInfo === 'object') {
             finalInfo = { ...finalInfo, ...customInfo };
             installer.addLog(`⚙️ Custom metadata applied`);
         }
 
         // Start callback server
-        await installer.startCallbackServer(pkgUrl, pkgSize, finalInfo);
+        installer.startCallbackServer(pkgUrl, pkgSize, finalInfo);
 
         // Prepare payload
         const payload = installer.preparePayload();
@@ -864,7 +630,7 @@ app.post('/api/prepare-install', async (req, res) => {
             extraction: extraction,
             serverIp: installer.pcIp,
             callbackPort: installer.callbackPort,
-            serverUrl: `http://${installer.pcIp}:${PORT}`,
+            serverUrl: `https://${installer.pcIp}`,
             installationId: installer.currentInstallation ? installer.currentInstallation.id : null
         });
     } catch (error) {
@@ -876,7 +642,7 @@ app.post('/api/prepare-install', async (req, res) => {
 app.post('/api/stop-installation', async (req, res) => {
     try {
         installer.addLog(`🛑 Stopping current installation`);
-        await installer.stopCallbackServer();
+        installer.stopCallbackServer();
         res.json({ success: true, message: 'Installation stopped' });
     } catch (error) {
         installer.addLog(`❌ Failed to stop installation: ${error.message}`);
@@ -939,94 +705,9 @@ app.get('/api/info', (req, res) => {
     });
 });
 
+// Serve the HTML frontend
 app.get('/', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>PS4 PKG Installer</title>
-            <style>
-                body { 
-                    font-family: Arial, sans-serif; 
-                    text-align: center; 
-                    padding: 20px; 
-                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    color: #fff;
-                    min-height: 100vh;
-                    margin: 0;
-                }
-                .container { 
-                    max-width: 800px; 
-                    margin: 0 auto; 
-                    background: rgba(42, 42, 42, 0.9); 
-                    padding: 40px; 
-                    border-radius: 15px;
-                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-                    border: 1px solid #0070ff;
-                }
-                h1 { 
-                    color: #0070ff; 
-                    font-size: 2.5em;
-                    margin-bottom: 20px;
-                    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-                }
-                .status-box {
-                    background: rgba(0, 112, 255, 0.1);
-                    border: 1px solid #0070ff;
-                    border-radius: 8px;
-                    padding: 20px;
-                    margin: 20px 0;
-                    text-align: left;
-                }
-                .endpoint {
-                    background: #333;
-                    padding: 10px;
-                    border-radius: 5px;
-                    margin: 10px 0;
-                    font-family: monospace;
-                    word-break: break-all;
-                }
-                a {
-                    color: #00a8ff;
-                    text-decoration: none;
-                    transition: color 0.3s;
-                }
-                a:hover {
-                    color: #4cd137;
-                    text-decoration: underline;
-                }
-                .logo {
-                    font-size: 4em;
-                    margin-bottom: 20px;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="logo">🎮</div>
-                <h1>PS4 PKG Installer Server</h1>
-                
-                <div class="status-box">
-                    <h3>Server Status</h3>
-                    <p><strong>Server URL:</strong> https://nopsn-be.onrender.com</p>
-                    <p><strong>Callback Port:</strong> ${installer.callbackPort}</p>
-                    <p><strong>Status:</strong> <span style="color: #4cd137;">✓ Running</span></p>
-                </div>
-                
-                <h3>API Endpoints</h3>
-                <div class="endpoint">GET <a href="/api/health">/api/health</a> - Server health check</div>
-                <div class="endpoint">POST /api/extract - Extract PKG metadata</div>
-                <div class="endpoint">POST /api/prepare-install - Prepare installation</div>
-                <div class="endpoint">GET <a href="/api/logs">/api/logs</a> - View server logs</div>
-                <div class="endpoint">GET <a href="/api/info">/api/info</a> - Server information</div>
-                
-                <p style="margin-top: 30px; color: #aaa;">
-                    Use the API endpoints with your PS4 PKG installer
-                </p>
-            </div>
-        </body>
-        </html>
-    `);
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 // Error handling middleware
@@ -1046,14 +727,13 @@ app.use((req, res) => {
 // Start server
 const server = app.listen(PORT, () => {
     console.log(`\n🚀 PS4 Direct Installer API Server`);
-    console.log(`Menu`);
     console.log(`==============================`);
-    console.log(`🌐 API URL: http://${installer.pcIp}:${PORT}`);
+    console.log(`🌐 Web Interface: https://${installer.pcIp}`);
     console.log(`📞 Callback Port: ${installer.callbackPort}`);
     console.log(`📁 Uploads Dir: ${installer.uploadDir}`);
     console.log(`🔒 CORS Allowed: *`);
     console.log(`Press Ctrl+C to stop`);
-    installer.addLog(`API Server started on http://${installer.pcIp}:${PORT}`);
+    installer.addLog(`API Server started on https://${installer.pcIp}`);
 });
 
 // Graceful shutdown
@@ -1061,7 +741,7 @@ process.on('SIGINT', async () => {
     console.log('\n🔄 Shutting down gracefully...');
 
     try {
-        await installer.stopCallbackServer();
+        installer.stopCallbackServer();
 
         if (installer.cacheCleanupInterval) {
             clearInterval(installer.cacheCleanupInterval);
@@ -1072,7 +752,6 @@ process.on('SIGINT', async () => {
             process.exit(0);
         });
 
-        // Force close after 5 seconds
         setTimeout(() => {
             console.log('⚠️ Forcing shutdown...');
             process.exit(1);
@@ -1086,7 +765,7 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
     console.log('\n🔻 Received SIGTERM, shutting down...');
-    await installer.stopCallbackServer();
+    installer.stopCallbackServer();
     server.close(() => {
         process.exit(0);
     });
