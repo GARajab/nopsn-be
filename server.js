@@ -18,6 +18,23 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '10mb' }));
+app.get('/api/proxy/:installationId', async (req, res) => {
+    const installation = installer.activeInstallations.get(req.params.installationId);
+    if (!installation) {
+        return res.status(404).send('Installation not found');
+    }
+
+    // Stream the PKG file through your server
+    const parsedUrl = new URL(installation.pkgUrl);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
+    protocol.get(installation.pkgUrl, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
+    }).on('error', (err) => {
+        res.status(500).send('Proxy error: ' + err.message);
+    });
+});
 
 class MultiUserInstaller {
     constructor() {
@@ -215,17 +232,8 @@ class MultiUserInstaller {
 
     buildMetadataPacket(pkgUrl, pkgSize, pkgInfo) {
         // IMPORTANT: Use HTTP URL for the PS4, not HTTPS
-        let pkgUrlForPS4 = pkgUrl;
-
-        // If PKG URL is HTTPS, we need to serve it via HTTP proxy
-        if (pkgUrl.toLowerCase().startsWith('https://')) {
-            // For HTTPS URLs, we'll need to proxy them through our HTTP server
-            // For now, we'll try to use HTTP if available
-            pkgUrlForPS4 = pkgUrl.replace('https://', 'http://');
-            this.addLog(`⚠️ Converting HTTPS URL to HTTP for PS4: ${pkgUrlForPS4}`);
-        }
-
-        const urlData = Buffer.from(pkgUrlForPS4, 'utf-8');
+        const proxyUrl = `http://74.220.49.1:3000/api/proxy/${installationId}`;
+        const urlData = Buffer.from(proxyUrl, 'utf-8');
         const nameData = Buffer.from(pkgInfo.title || 'Game', 'utf-8');
         const contentIdData = Buffer.from(pkgInfo.contentId || 'UP0000-CUSA00000_00-GAME0000000000', 'utf-8');
         const titleIdData = Buffer.from(pkgInfo.titleId || 'CUSA00000', 'utf-8');
