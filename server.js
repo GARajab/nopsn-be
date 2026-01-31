@@ -17,25 +17,32 @@ app.use(express.static('public'));
 
 class DualRequestInstaller {
     constructor() {
-        this.pcIp = this.getDeploymentIp();
-        this.callbackPort = parseInt(process.env.CALLBACK_PORT) || 9022;
-        this.callbackServer = null;
-        this.activeConnections = new Map();
+        // Initialize ALL properties FIRST
         this.installationLog = [];
-        this.extractor = new PKGExtractor();
+        this.activeConnections = new Map();
+        this.currentInstallation = null;
+        this.callbackServer = null;
         this.uploadDir = path.join(__dirname, 'uploads');
         this.cacheCleanupInterval = null;
-
-        // Installation session tracking
-        this.currentInstallation = null;
+        this.idleServerTimeout = null;
+        this.connectionCleanupInterval = null;
 
         // Create uploads directory if it doesn't exist
         if (!fs.existsSync(this.uploadDir)) {
             fs.mkdirSync(this.uploadDir, { recursive: true });
         }
 
+        // Initialize extractor
+        this.extractor = new PKGExtractor();
+
+        // NOW get deployment IP (which will use addLog)
+        this.pcIp = this.getDeploymentIp();
+        this.callbackPort = parseInt(process.env.CALLBACK_PORT) || 9022;
+
         // Start cache cleanup
         this.startCacheCleanup();
+
+        this.addLog(`✅ DualRequestInstaller initialized`);
     }
 
     getDeploymentIp() {
@@ -76,6 +83,12 @@ class DualRequestInstaller {
         const timestamp = new Date().toLocaleTimeString();
         const logMsg = `[${timestamp}] ${msg}`;
         console.log(logMsg);
+
+        // Ensure installationLog exists (safety check)
+        if (!this.installationLog) {
+            this.installationLog = [];
+        }
+
         this.installationLog.push(logMsg);
 
         // Keep log size manageable (last 1000 entries)
@@ -997,7 +1010,7 @@ app.get('/', (req, res) => {
                 
                 <div class="status-box">
                     <h3>Server Status</h3>
-                    <p><strong>Server IP:</strong> ${installer.pcIp}:${PORT}</p>
+                    <p><strong>Server URL:</strong> https://nopsn-be.onrender.com</p>
                     <p><strong>Callback Port:</strong> ${installer.callbackPort}</p>
                     <p><strong>Status:</strong> <span style="color: #4cd137;">✓ Running</span></p>
                 </div>
@@ -1010,7 +1023,7 @@ app.get('/', (req, res) => {
                 <div class="endpoint">GET <a href="/api/info">/api/info</a> - Server information</div>
                 
                 <p style="margin-top: 30px; color: #aaa;">
-                    Use the API endpoints with your PKG installer client
+                    Use the API endpoints with your PS4 PKG installer
                 </p>
             </div>
         </body>
@@ -1034,14 +1047,15 @@ app.use((req, res) => {
 
 // Start server
 const server = app.listen(PORT, () => {
-    console.log(`\n🚀 PS4 PKG Installer Server`);
-    console.log(`============================`);
-    console.log(`🌐 Server: http://${installer.pcIp}:${PORT}`);
-    console.log(`📞 Callback port: ${installer.callbackPort}`);
-    console.log(`📁 Uploads directory: ${installer.uploadDir}`);
-    console.log(`📦 Payload file: ${fs.existsSync(path.join(__dirname, 'payload.bin')) ? '✓ Found' : '✗ Missing'}`);
-    console.log(`\n✅ Server is ready!\n`);
-    installer.addLog(`Server started on port ${PORT}`);
+    console.log(`\n🚀 PS4 Direct Installer API Server`);
+    console.log(`Menu`);
+    console.log(`==============================`);
+    console.log(`🌐 API URL: http://${installer.pcIp}:${PORT}`);
+    console.log(`📞 Callback Port: ${installer.callbackPort}`);
+    console.log(`📁 Uploads Dir: ${installer.uploadDir}`);
+    console.log(`🔒 CORS Allowed: *`);
+    console.log(`Press Ctrl+C to stop`);
+    installer.addLog(`API Server started on http://${installer.pcIp}:${PORT}`);
 });
 
 // Graceful shutdown
