@@ -257,7 +257,6 @@ class MultiUserInstaller {
         return packet;
     }
 
-    // ADD THIS MISSING METHOD:
     startOrGetCallbackServer() {
         if (!this.callbackServer) {
             this.callbackServer = net.createServer((socket) => {
@@ -269,7 +268,8 @@ class MultiUserInstaller {
                     connectionId: connectionId,
                     startTime: Date.now(),
                     installationId: null,
-                    lastActivity: Date.now()
+                    lastActivity: Date.now(),
+                    bytesStreamed: 0
                 };
                 this.activeConnections.set(connectionId, connection);
 
@@ -289,7 +289,7 @@ class MultiUserInstaller {
                     const conn = this.activeConnections.get(connectionId);
                     if (conn) {
                         const duration = (Date.now() - conn.startTime) / 1000;
-                        this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s`);
+                        this.addLog(`🔌 Closed (${connectionId}): ${duration.toFixed(1)}s, ${(conn.bytesStreamed / 1024 / 1024).toFixed(2)}MB`);
                     }
                     this.activeConnections.delete(connectionId);
                 });
@@ -357,7 +357,6 @@ class MultiUserInstaller {
         return this.callbackServer;
     }
 
-    // ADD THIS METHOD TOO:
     createInstallation(pkgUrl, pkgSize, pkgInfo) {
         const installationId = `inst_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
 
@@ -369,7 +368,10 @@ class MultiUserInstaller {
             hasSentMetadata: false,
             isStreaming: false,
             createdAt: Date.now(),
-            connections: new Set()
+            connections: new Set(),
+            dataStreamStarted: false,
+            fileStream: null,
+            httpStream: null
         };
 
         this.activeInstallations.set(installationId, installation);
@@ -381,7 +383,6 @@ class MultiUserInstaller {
         return installationId;
     }
 
-    // ADD THIS METHOD:
     handlePS4Connection(socket, connectionId, installationId) {
         const connection = this.activeConnections.get(connectionId);
         const installation = this.activeInstallations.get(installationId);
@@ -405,37 +406,22 @@ class MultiUserInstaller {
             this.addLog(`📤 Sending metadata for "${installation.pkgInfo.title}" to ${connectionId}`);
             this.sendMetadata(socket, connectionId, installation);
             installation.hasSentMetadata = true;
+            installation.currentSocket = socket;
         } else if (!installation.isStreaming) {
-            // Second connection - acknowledge
+            // Second connection - start streaming package data
             this.addLog(`✅ PS4 ${installationId} ready to download "${installation.pkgInfo.title}"`);
             installation.isStreaming = true;
+            installation.currentSocket = socket;
 
-            // Send success response (0x01)
-            socket.write(Buffer.from([0x01]), (err) => {
-                if (err) {
-                    this.addLog(`❌ Failed to send ack to ${connectionId}: ${err.message}`);
-                } else {
-                    this.addLog(`✅ Sent success response to ${connectionId}`);
-                    this.addLog(`🎮 PS4 should now download "${installation.pkgInfo.title}" directly`);
-                }
-                socket.end();
-            });
-
-            // Schedule cleanup
-            setTimeout(() => {
-                if (this.activeInstallations.has(installationId)) {
-                    this.addLog(`🧹 Cleaning up completed installation: ${installationId}`);
-                    this.activeInstallations.delete(installationId);
-                }
-            }, 300000);
+            // Start streaming the package
+            this.startPackageStream(socket, connectionId, installation);
         } else {
-            // Already processed
-            this.addLog(`ℹ️ Installation ${installationId} already processed`);
+            // Already streaming
+            this.addLog(`ℹ️ Installation ${installationId} already streaming`);
             socket.end();
         }
     }
 
-    // ADD THIS METHOD:
     sendMetadata(socket, connectionId, installation) {
         try {
             const metadata = this.buildMetadataPacket(
@@ -456,6 +442,9 @@ class MultiUserInstaller {
                 } else {
                     this.addLog(`✅ Metadata sent to ${connectionId}`);
                     this.addLog(`🔄 Waiting for PS4 to reconnect for download...`);
+
+                    // PS4 will disconnect after receiving metadata
+                    // We'll wait for it to reconnect for the actual download
                 }
             });
         } catch (err) {
@@ -464,7 +453,115 @@ class MultiUserInstaller {
         }
     }
 
-    // ADD THESE HELPER METHODS:
+    startPackageStream(socket, connectionId, installation) {
+        this.addLog(`🚀 Starting package stream for "${installation.pkgInfo.title}"`);
+
+        const parsedUrl = new URL(installation.pkgUrl);
+        const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
+        const options = {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port,
+            path: parsedUrl.pathname + parsedUrl.search,
+            headers: {
+                'User-Agent': 'PS4-Installer/1.0',
+                'Range': 'bytes=0-' // Stream from beginning
+            }
+        };
+
+        let bytesStreamed = 0;
+        let startTime = Date.now();
+        let lastLogTime = startTime;
+
+        const httpReq = protocol.get(options, (httpRes) => {
+            if (httpRes.statusCode !== 200 && httpRes.statusCode !== 206) {
+                this.addLog(`❌ HTTP ${httpRes.statusCode}: ${httpRes.statusMessage}`);
+                socket.destroy();
+                return;
+            }
+
+            const contentLength = parseInt(httpRes.headers['content-length'] || '0', 10);
+            this.addLog(`📥 Streaming ${(contentLength / 1024 / 1024).toFixed(2)}MB from ${installation.pkgUrl}`);
+
+            installation.httpStream = httpRes;
+
+            // Stream data to PS4
+            httpRes.on('data', (chunk) => {
+                bytesStreamed += chunk.length;
+
+                // Update connection bytes streamed
+                const connection = this.activeConnections.get(connectionId);
+                if (connection) {
+                    connection.bytesStreamed = bytesStreamed;
+                }
+
+                // Stream to PS4
+                const canWrite = socket.write(chunk);
+                if (!canWrite) {
+                    // Pause HTTP stream if PS4 buffer is full
+                    httpRes.pause();
+                    socket.once('drain', () => {
+                        httpRes.resume();
+                    });
+                }
+
+                // Log progress every 5 seconds
+                const now = Date.now();
+                if (now - lastLogTime > 5000) {
+                    const elapsed = (now - startTime) / 1000;
+                    const speed = bytesStreamed / elapsed / 1024 / 1024;
+                    const percent = contentLength > 0 ? (bytesStreamed / contentLength * 100).toFixed(1) : '?';
+
+                    this.addLog(`📊 Download: ${(bytesStreamed / 1024 / 1024).toFixed(2)}MB (${percent}%) @ ${speed.toFixed(2)}MB/s`);
+                    lastLogTime = now;
+                }
+            });
+
+            httpRes.on('end', () => {
+                this.addLog(`✅ Stream complete! ${(bytesStreamed / 1024 / 1024).toFixed(2)}MB in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+
+                // Wait a bit before closing socket
+                setTimeout(() => {
+                    if (!socket.destroyed) {
+                        socket.end();
+                    }
+                }, 2000);
+
+                // Clean up installation after completion
+                setTimeout(() => {
+                    this.cleanupInstallation(installationId);
+                }, 5000);
+            });
+
+            httpRes.on('error', (err) => {
+                this.addLog(`❌ HTTP stream error: ${err.message}`);
+                socket.destroy();
+            });
+        });
+
+        httpReq.on('error', (err) => {
+            this.addLog(`❌ HTTP request error: ${err.message}`);
+            socket.destroy();
+        });
+
+        installation.httpRequest = httpReq;
+
+        // Handle socket close/error
+        socket.on('error', (err) => {
+            this.addLog(`❌ Socket error during stream: ${err.message}`);
+            if (httpReq && !httpReq.destroyed) {
+                httpReq.destroy();
+            }
+        });
+
+        socket.on('close', () => {
+            this.addLog(`🔌 PS4 connection closed during stream`);
+            if (httpReq && !httpReq.destroyed) {
+                httpReq.destroy();
+            }
+        });
+    }
+
     getInstallationStatus(installationId) {
         const installation = this.activeInstallations.get(installationId);
         if (!installation) return null;
@@ -483,12 +580,18 @@ class MultiUserInstaller {
         if (this.activeInstallations.has(installationId)) {
             const installation = this.activeInstallations.get(installationId);
 
+            // Close all connections
             for (const connectionId of installation.connections) {
                 const connection = this.activeConnections.get(connectionId);
                 if (connection && connection.socket && !connection.socket.destroyed) {
                     connection.socket.destroy();
                 }
                 this.activeConnections.delete(connectionId);
+            }
+
+            // Close HTTP stream if active
+            if (installation.httpRequest && !installation.httpRequest.destroyed) {
+                installation.httpRequest.destroy();
             }
 
             this.activeInstallations.delete(installationId);
@@ -678,7 +781,7 @@ app.get('/api/stats', (req, res) => {
             callbackServer: installer.callbackServer ? 'Running' : 'Stopped'
         },
         limits: {
-            maxConcurrentInstallations: 50, // You can adjust this
+            maxConcurrentInstallations: 50,
             installationTimeout: "15 minutes",
             connectionTimeout: "30 seconds"
         }
