@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 
 // Configure CORS to allow all origins
 app.use(cors({
-    origin: '*',
+    origin: ['https://nopsn-fe.free.nf', 'http://nopsn-fe.free.nf'],
     credentials: true
 }));
 
